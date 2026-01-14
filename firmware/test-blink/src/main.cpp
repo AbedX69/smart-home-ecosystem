@@ -8,5 +8,5 @@ void loop() {
   digitalWrite(2, HIGH);
   delay(100);  // Changed from 1000 to 200
   digitalWrite(2, LOW);
-  delay(300);  // Faster blinking!
+  delay(1000);  // Faster blinking!
 }
