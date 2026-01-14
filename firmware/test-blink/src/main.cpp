@@ -6,7 +6,7 @@ void setup() {
 
 void loop() {
   digitalWrite(2, HIGH);
-  delay(100);  // Changed from 1000 to 200
+  delay(3000);  // Changed from 1000 to 200
   digitalWrite(2, LOW);
   delay(1000);  // Faster blinking!
 }
