@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 
+
 static const char *TAG = "LED_TEST";
 
 extern "C" void app_main(void) {
@@ -25,6 +26,6 @@ extern "C" void app_main(void) {
         gpio_set_level((gpio_num_t)LED_PIN, state ? 1 : 0);
         ESP_LOGI(TAG, "LED %s", state ? "ON" : "OFF");
         state = !state;
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
