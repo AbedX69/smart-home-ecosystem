@@ -39,3 +39,49 @@ Figure out what pin the big ESP32-C6 LED is actually wired to.
 
 **Notes / mindset**
 Folder structure and project organization still needs work — but I want to first become confident in what I’m doing, not just copy-pasting whatever AI tells me.
+
+
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+### Dev Log — 21/01/2026 (Wed)
+
+**Goal today:** make the workflow smoother between my main PC (coding) and test PC (flashing/testing).
+
+#### What I did
+
+* Improved my workstation setup:
+
+  * I write code on the **main PC**.
+  * I copy the project to the **test PC** over the network.
+  * I build/run/flash from the **test PC** on real hardware.
+* Ran a quick validation test by changing the LED blink timing from **200ms** to **2000ms**.
+* Confirmed it works smoothly on **4 boards**:
+
+  * **ESP32-D**
+  * **ESP32-S3 WROOM**
+  * **ESP32-C6 Seeed Studio**
+  * **ESP32-S3 Seeed Studio**
+
+#### Issues / notes
+
+* PlatformIO setup on the test PC was rough at first — it was downloading/loading a lot of stuff.
+* Later I want to optimize this so it starts/builds faster.
+
+#### Content / documentation
+
+* Filmed a short clip of the workflow.
+* Next step: edit the video and upload it to YouTube as part of my build/documentation series.
+
+#### Next milestone
+
+* Start working on my **first real component: a rotary encoder**.
+* I began creating the project/files for it today.
+* Goal: get the rotary encoder working across the same boards listed above.
