@@ -85,3 +85,12 @@ Folder structure and project organization still needs work — but I want to fir
 * Start working on my **first real component: a rotary encoder**.
 * I began creating the project/files for it today.
 * Goal: get the rotary encoder working across the same boards listed above.
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
