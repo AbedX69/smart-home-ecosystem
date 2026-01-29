@@ -1,0 +1,80 @@
+🧠 I2C / Expansion (need testing)
+
+ TCA9548A I2C multiplexer (1-to-8)
+
+
+
+
+
+📷 Cameras (need testing)
+
+ OV7670 camera module
+
+ ESP32-S3 CAM dev boards (OV2640/OV5640)
+
+ ESP32-CAM board (OV2640)
+
+
+
+
+ ⚡ Switching / Power / Drivers (need testing)
+
+ 8-channel 5V relay boards (opto type)
+
+ Solid State Relays (SSR) DC→AC (10A/25A/40A)
+
+ ESP32 WiFi/BLE relay module board (AC90-250V / DC5-30V)
+
+ IRLB8721 MOSFETs (discrete power switching)
+
+ High-power MOSFET trigger switch boards (5–36V, 15A/30A)
+
+ DC-DC buck converters
+
+ 15–80V → 12V 3A (car buck)
+
+ Multi-output buck (12V → 3.3V/5V/12V)
+
+ Power supplies
+
+ 5V USB chargers
+
+ 24V LED power supply/driver (150W)
+
+
+
+ 🔊 Audio (need testing)
+
+
+ PCM5102A I2S DAC modules
+
+ MAX98357 I2S Class-D amp modules
+
+
+
+
+ 🖥️ Displays (need testing)
+
+ OLED SSD1306 (0.91" / 0.96" I2C)
+
+ OLED SSD1357 (0.6" color 64×64)
+
+ TFT ST7789 (1.69" 240×280)
+
+ TFT SPI modules (2.4" IPS ST7735-type)
+
+ ILI9341 2.8" TFT + touch
+
+ GC9A01 1.28" round TFT
+
+ 2.13" e-paper display (tri-color)
+
+
+
+
+
+ 📡 Wireless / Remote control (need testing)
+
+ SX1262 LoRa modules (DX-LR30 dev set + SX1262 SMD module set)
+
+ Seeed XIAO ESP32S3 LoRa / Meshtastic kit
