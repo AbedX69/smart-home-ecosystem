@@ -416,3 +416,73 @@ All files have **both** professional Doxygen-style documentation AND detailed be
 
 
 
+Dev Log — Button & Touch Sensor Components
+Date: 30/01/2026
+Components: Tactile Button, Outemu Mechanical Switch, TTP223 Touch, HTTM Touch + RGB LED
+Goal: Build reusable button and touch components for all 5 ESP32 boards.
+
+Boards Tested
+BoardPinsStatusESP32DGPIO 18, 19✅ WorksESP32-S3 WROOMGPIO 18, 19✅ WorksESP32-S3 Seeed XIAOGPIO 1, 2✅ WorksESP32-C6 WROOMGPIO 18, 19✅ WorksESP32-C6 Seeed XIAOGPIO 0, 1✅ Works
+
+What I Learned
+Buttons Use Polling, Not Interrupts
+
+Encoder needs interrupts (fast rotation)
+Buttons are slow (human speed) → polling every 10ms is fine
+
+Why 4 Pins on Tactile Buttons
+
+Pins 1-2 connected internally, pins 3-4 connected internally
+Use diagonal pair (1-4 or 2-3) to cross the switch
+Extra pins for PCB stability, not electrical need
+
+TTP223 Jumper Settings
+JumperOpenBridgedA (TOG)MomentaryToggle (tap on/off)B (AHLB)Active HIGH + 7s timeoutActive LOW + no timeout
+HTTM Has Same Chip as TTP223
+
+Default: toggle mode + RGB cycling
+Removed resistor "102" → converted to momentary mode
+
+Touch Sensitivity
+
+Add capacitor between touch pad and GND
+No cap = most sensitive, 47pF = least sensitive
+Ceramic capacitors have no polarity
+
+No Debounce Needed for Touch
+
+Mechanical buttons bounce → need 50ms debounce
+Capacitive touch has no moving parts → chip filters internally
+
+
+Project Structure
+firmware/
+├── components/
+│   ├── button/      ← Tactile + mechanical switches
+│   └── touch/       ← TTP223 + HTTM capacitive
+└── testing/
+    ├── button-test/ ← All 5 boards configured
+    └── touch-test/  ← All 5 boards configured
+
+Key Takeaways
+
+Polling works for slow inputs — no interrupts needed for buttons/touch
+Diagonal wiring on 4-pin buttons — pins are paired internally
+Touch modules have hidden settings — jumpers/resistors change behavior
+TTP223 = HTTM — same chip, HTTM adds RGB LED
+No pull-up on touch — active output drives the line
+
+
+
+
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
