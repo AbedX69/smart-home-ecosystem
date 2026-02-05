@@ -484,5 +484,86 @@ No pull-up on touch — active output drives the line
 
 
 
+## Dev Log — February + March Plan (updated) — 05.02.2026
+
+### Phase 1 — **Now → Feb 17**
+
+**Rush drivers (AI-assisted), test only on ESP32D, minimal docs.**
+
+Targets:
+
+* **SSD1357Z** (0.6" 64×64 RGB display)
+* **MAX98357** (I2S audio amp)
+* **PCA9548A** (I2C multiplexer for multi displays)
+* **Relay + SSR**
+* **Vibration motors**
+* **Buzzer**
+* **MOSFET PWM dimming** (lights)
+
+Goal: “works on ESP32D with a quick demo” for each.
+
+---
+
+### Phase 2 — **Ramadan start (~Feb 18) → ~Feb 23** (≈ 5 days)
+
+**Proper testing + video documentation across all 5 boards.**
+
+What happens here:
+
+* Flash + test each driver on every board
+* Fix pin maps + board-specific issues
+* Record clean dev-log footage while doing it
+
+Deliverable: each component has a verified “works on all boards” test.
+
+---
+
+### Phase 3 — **~Feb 23 → Feb 28**
+
+**Study + API mindset.**
+
+* Read your own drivers like a library:
+
+  * what functions exist
+  * how they should be used
+  * what parameters/limits exist
+* Clean up naming / usage patterns so they feel consistent
+
+Deliverable: you can use each driver confidently without guessing.
+
+---
+
+## March Plan
+
+### March 1 → March 23
+
+**Build the wired “everything” prototype (proof of concept).**
+
+* All components wired + running together
+* Not pretty, just functional and testable
+* Film key progress
+
+Deliverable: one integrated wired prototype doing the full demo.
+
+---
+
+### ~March 23 → End of March
+
+**Wireless phase + new drivers + filming**
+
+* Add wireless logic + architecture
+* Build drivers for:
+
+  * **Camera: OV26740**
+  * **Audio DAC: PCM5102A**
+* Study them like APIs again
+* Start assembling wireless prototypes + film
+
+Deliverable: wireless prototype direction is real (not just theory), and the two new drivers are alive.
+
+---
+
+Everything after that stays the same (enclosures month, then app/website POC).
 
 
+##############################################################################################################################################################################################################################################################################################################################################################################################################################

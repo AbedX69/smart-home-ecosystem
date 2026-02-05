@@ -134,8 +134,12 @@ bool XPT2046::init() {
  * =============================================================================
  */
 bool XPT2046::isTouched() {
+
+    //to debug
+      uint16_t z = readChannel(CMD_READ_Z1);
+    return z > 100;
     // IRQ pin is active LOW when touched
-    return gpio_get_level(irqPin) == 0;
+    //return gpio_get_level(irqPin) == 0;
 }
 
 

@@ -76,12 +76,13 @@ extern "C" void app_main(void) {
     
     ESP_LOGI(TAG, "Display initialized. Running tests...");
 
-     while (1) {
+    
     /*
      * -------------------------------------------------------------------------
      * TEST 1: Color Fills
      * -------------------------------------------------------------------------
      */
+     while (1) { 
     ESP_LOGI(TAG, "Test 1: Colors");
     
     uint16_t colors[] = {COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW, COLOR_CYAN, COLOR_MAGENTA};

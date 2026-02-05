@@ -78,7 +78,9 @@ extern "C" void app_main(void) {
         return;
     }
     ESP_LOGI(TAG, "Display initialized");
-    
+    display.setRotation(3);
+    ESP_LOGI(TAG, "Display size: %dx%d", display.getWidth(), display.getHeight());
+
     /*
      * =========================================================================
      * STEP 2: Initialize touch (shares SPI bus with display)
@@ -97,7 +99,7 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Touch initialized");
     
     // Set calibration (you may need to adjust these for your display)
-    touch.setCalibration(200, 3800, 300, 3700);
+    touch.setCalibration(3800,200,  300, 3700);
     
     /*
      * =========================================================================
@@ -153,11 +155,7 @@ extern "C" void app_main(void) {
     uint16_t drawColor = COLOR_BLUE;
     
 while (1) {
-    int16_t rawX, rawY;
-    // Force read (ignore IRQ)
-    touch.getRawPosition(&rawX, &rawY);
-    ESP_LOGI(TAG, "Raw: X=%d Y=%d", rawX, rawY);
-    vTaskDelay(pdMS_TO_TICKS(200));
+ 
     if (touch.isTouched()) {
             int16_t x, y;
             int16_t rawX, rawY;
