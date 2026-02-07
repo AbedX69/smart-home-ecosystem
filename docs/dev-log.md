@@ -567,3 +567,112 @@ Everything after that stays the same (enclosures month, then app/website POC).
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+### Dev Log — 07/02/2026 (Sat)
+
+#### What I did today
+
+Created drivers for these components:
+
+* **SSD1357Z** (0.6" 64×64 RGB display)
+* **MAX98357** (I2S audio amp)
+* **Relay + SSR**
+* **Vibration motors**
+* **Buzzer**
+
+I started from easiest → hardest: **Relay/SSR → Buzzer → Vibration motors → MAX98357 → SSD1357Z**.
+
+---
+
+## Component Notes
+
+### 1) Relay + SSR ✅
+
+* Driver was straightforward.
+* Testing on **ESP32D** went smoothly (no issues worth noting).
+
+---
+
+### 2) Buzzer ✅
+
+* Driver + testing went smoothly.
+* **Observation:** some frequencies are noticeably louder than others.
+
+  * Around **2 kHz** sounds like a good “default loud” frequency.
+  * If I want “animated” tones/melodies, I can vary frequency but I’ll lose some volume on certain notes (acceptable tradeoff).
+
+---
+
+### 3) Vibration motors ✅ (with tweak)
+
+* Driver worked, but my first tap/double/triple tap timings were too short:
+
+  * I had taps set to **50ms** → motor sometimes didn’t even start.
+* **Fix:** changed tap duration to **100ms** and it became reliable.
+* **Guess:** the vibration module has capacitors that soak the initial current for a moment.
+* **Observation:** some PWM values feel “stronger/more intense” than others (not all PWM levels feel equal).
+
+---
+
+### 4) MAX98357 (I2S Audio Amp) ✅
+
+* Setup + flashing were smooth, no major problems.
+* **Observation:** in **TEST 5: “Twinkle Twinkle Little Star”**, some notes are *way* louder than others.
+
+  * Not sure yet if it’s:
+
+    * speaker limitation,
+    * code/tone generation,
+    * or amp behavior.
+* For now, I’m accepting it as “good enough” and moving on.
+
+---
+
+### 5) SSD1357Z (0.6" 64×64 RGB) ❌ (big issue)
+
+This one did not behave.
+
+What happened:
+
+* Wired it to the **correct pins** → **no sign of life**.
+* Lowered SPI clock from **10 MHz → 1 MHz** → still nothing.
+* Tried a few wiring changes → still nothing.
+* Took a break (PC off, gym, food, shower).
+* When I came back and powered up:
+
+  * the display **briefly showed something**,
+  * then went **black again** like it “died”.
+* To remove breadboard/contact issues:
+
+  * I **soldered header pins** onto the display module.
+  * Still **no sign of life** after that.
+* I then verified wiring properly:
+
+  * Used a multimeter and continuity-tested every connection from **ESP32D pin → display pin**.
+  * Everything checked out.
+* **Status:** I don’t know yet if it’s a driver/init sequence problem, a reset/power issue, a bad module, or something subtle like CS/DC/RST behavior.
+
+---
+
+## Plan for tomorrow (08/02/2026)
+
+### Hardware prep
+
+* Improve soldering.
+* Solder pins onto **all ESP boards** so I can plug them into a breadboard cleanly.
+* This will make **testing + filming** way easier.
+
+### Drivers to build next (ESP32D testing)
+
+* **PCA9548A** (I2C multiplexer for multi displays)
+* **MOSFET PWM dimming** (lights)
+
+
+
+
+
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
