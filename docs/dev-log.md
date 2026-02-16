@@ -676,3 +676,96 @@ What happened:
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+### Dev Log — 16/02/2026 (Mon) — Updated
+
+#### Status update (big milestone)
+
+For the past **5 days**, I tested components while filming **both the computer screen and the real hardware**.
+Everything I tested is now **fully video documented**, which I’m really happy with.
+
+✅ **Result:** the first **quarter (1/4)** is done:
+
+* component **drivers work**
+* everything is **documented on video**
+* the workflow is repeatable
+
+> **Note:** most of the “working footage” so far is on **ESP32-S3 WROOM**.
+
+---
+
+## Project flow (big picture)
+
+**Drivers first → systems → wireless → wireless system/ecosystem → packaging → real world**
+
+And my detailed pipeline now is:
+
+**Component drivers → Docs (I’m here) → Learn what’s done (next) → Combined testing → Docs →
+Wireless drivers → Docs → Learn what’s done → Combined testing → Docs →
+Editing → Enclosures/packaging → Docs → Real-life testing**
+
+---
+
+## Hardware issue today
+
+One of the **ESP32-S3 WROOM serial/UART ports** stopped working.
+I switched to the other port (**OTG**) and kept going.
+
+---
+
+## Far-future components (if I get time)
+
+* **microSD** (read/write + file management)
+* **cameras** (capture/streaming)
+
+---
+
+## Component tracker (updated)
+
+**SSD1357 is canceled and removed.**
+
+| #  | Component     | Location           | Status | Notes                     |
+| -- | ------------- | ------------------ | ------ | ------------------------- |
+| 1  | SSD1306       | `display/ssd1306/` | ✅      | 0.96" OLED mono           |
+| 2  | GC9A01        | `display/gc9a01/`  | ✅      | 1.28" round TFT           |
+| 3  | ST7789        | `display/st7789/`  | ✅      | 1.69" TFT                 |
+| 4  | ILI9341       | `display/ili9341/` | ✅      | 2.8" TFT + XPT2046 touch  |
+| 5  | E-paper       | `display/epaper/`  | ✅      | 2.13" tri-color e-ink     |
+| 6  | MAX98357      | `audio/max98357/`  | ✅      | I2S amp                   |
+| 7  | PCA9548A      | `i2c/pca9548a/`    | ✅      | I2C mux 1→8               |
+| 8  | Encoder       | `encoder/`         | ✅      | rotary + button           |
+| 9  | Button        | `button/`          | ✅      | debounced input           |
+| 10 | Touch         | `touch/`           | ✅      | TTP223 module             |
+| 11 | Buzzer        | `buzzer/`          | ✅      | tones + melodies          |
+| 12 | Vibration     | `vibration/`       | ✅      | haptic patterns           |
+| 13 | Relay         | `relay/`           | ✅      | relay / SSR control       |
+| 14 | PWM Dimmer    | `pwm_dimmer/`      | ✅      | dimming + gamma           |
+| 15 | MOSFET Driver | `mosfet_driver/`   | ✅      | power MOSFET + soft start |
+
+---
+
+## Documentation checklist per component
+
+For each component:
+
+* [ ] wiring photo
+* [ ] video of it working *(mostly done already)*
+
+---
+
+## Next step (immediately after Docs)
+
+### **Learn what’s done**
+
+Go through each driver like an API:
+
+* what functions exist
+* what parameters matter
+* what the “correct usage pattern” is
+
+Then I move into **combined testing** (multiple components together, reaction times, conflicts, real behavior).
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################

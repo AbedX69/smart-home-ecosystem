@@ -78,7 +78,7 @@ extern "C" void app_main(void) {
         return;
     }
     ESP_LOGI(TAG, "Display initialized");
-    display.setRotation(3);
+    display.setRotation(2);
     ESP_LOGI(TAG, "Display size: %dx%d", display.getWidth(), display.getHeight());
 
     /*
@@ -99,9 +99,9 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Touch initialized");
     
     // Set calibration (you may need to adjust these for your display)
-    touch.setCalibration(3800,200,  300, 3700);
+    touch.setCalibration(200,3800, 3700,  300);
     
-    /*
+    /*ponh,. mn6
      * =========================================================================
      * STEP 3: Display test - show colors
      * =========================================================================

@@ -109,16 +109,7 @@ bool MAX98357::init(uint32_t sampleRate, uint8_t bitsPerSample) {
             .clk_src = I2S_CLK_SRC_DEFAULT,
             .mclk_multiple = I2S_MCLK_MULTIPLE_256,
         },
-        .slot_cfg = {
-            .data_bit_width = (i2s_data_bit_width_t)bitsPerSample,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
-            .slot_mode = I2S_SLOT_MODE_MONO,
-            .slot_mask = I2S_STD_SLOT_LEFT,
-            .ws_width = bitsPerSample,
-            .ws_pol = false,
-            .bit_shift = true,
-            .msb_right = false,
-        },
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG((i2s_data_bit_width_t)bitsPerSample, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = GPIO_NUM_NC,
             .bclk = bclkPin,

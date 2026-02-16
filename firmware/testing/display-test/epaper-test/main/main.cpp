@@ -200,7 +200,7 @@ extern "C" void app_main(void) {
     }
     
     // Border
-    display.drawRect(0, 0, 122, 120, EPAPER_RED);
+    display.drawRect(0, 0, 130, 120, EPAPER_RED);
     
     // Message
     display.drawString(5, 140, "E-Paper Test", EPAPER_BLACK, 2);
