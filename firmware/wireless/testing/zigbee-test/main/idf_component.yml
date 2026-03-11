@@ -1,0 +1,9 @@
+## IDF Component Manager manifest
+## These dependencies are automatically downloaded at build time
+## from the ESP Component Registry (https://components.espressif.com)
+
+dependencies:
+  espressif/esp-zigbee-lib:
+    version: "~1.5.0"
+  espressif/esp-zboss-lib:
+    version: "~1.5.0"

@@ -1,0 +1,7 @@
+# =============================================================================
+# OTA Configuration
+# =============================================================================
+# Enable rollback support so the bootloader can revert to previous firmware
+# if the new one doesn't call esp_ota_mark_app_valid_cancel_rollback().
+
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

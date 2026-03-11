@@ -1,0 +1,9 @@
+# Use this sdkconfig for Coordinator or Router builds:
+#   board_build.cmake_extra_args = -DSDKCONFIG_DEFAULTS=sdkconfig.coordinator
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
