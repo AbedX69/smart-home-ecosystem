@@ -769,3 +769,189 @@ Then I move into **combined testing** (multiple components together, reaction ti
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
+
+### Dev Log — 11/03/2026 (Wed)
+
+#### Big picture progress
+
+For the past couple of weeks, I’ve been in **“study mode”** — going through **every component driver** I’ve built so far and really understanding how they work, not just getting them to blink. This felt like the right move before moving into combined testing and wireless.
+
+---
+
+## What I did
+
+### 1. Studied all existing components (the full list)
+
+I went back through every driver from the earlier sprints:
+
+| Category   | Components                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------ |
+| Displays   | SSD1306, GC9A01, ST7789, ILI9341 (+XPT2046 touch), E-paper 2.13"                                 |
+| Audio      | MAX98357 (I2S amp)                                                                               |
+| I2C        | PCA9548A (multiplexer)                                                                           |
+| Input      | Rotary encoder (with interrupts), Button (debounced), TTP223 / HTTM touch                        |
+| Output     | Buzzer, Vibration motors, Relay / SSR, PWM Dimmer (with gamma), MOSFET driver (soft-start)       |
+
+For each one, I:
+
+- Read through the code with AI explanations
+- Understood **why** certain patterns were used (volatile, IRAM_ATTR, debounce timings, etc.)
+- Took **personal notes** on things I’d like to improve or change (timing tweaks, API consistency, better error handling)
+
+> **Important:** I *didn’t* copy those suggested changes into the main `components/` folder.  
+> I want to keep this folder as a **clean, working reference** — only code that’s been tested and works.  
+> The ideas are saved elsewhere; they’ll get merged later when I do a “polish” pass.
+
+---
+
+### 2. Added a `wireless/` folder structure
+
+I’ve been thinking about wireless for a while, so I finally created the skeleton:
+
+```
+firmware/
+├── components/          (existing)
+├── production/           (future)
+├── shared/               (shared utilities)
+├── testing/              (component test apps)
+└── wireless/             ← NEW
+    ├── communication/     (driver‑level implementations)
+    │   ├── ble/
+    │   ├── esp_now/
+    │   ├── lora/
+    │   ├── ota/
+    │   ├── wifi/
+    │   └── zigbee/
+    └── testing/           (test apps for each wireless type)
+        ├── ble-test/
+        ├── esp-now-test/
+        ├── lora-test/
+        ├── ota-test/
+        ├── system-test/   (future: multiple protocols together)
+        ├── wifi-test/
+        └── zigbee-test/
+```
+
+This keeps wireless separate from the basic component drivers, which feels right — wireless adds a whole new layer of complexity.
+
+---
+
+### 3. WiFi + OTA — first wireless milestone
+
+I dug into WiFi, built a test app in `wireless/testing/wifi-test/`, and got it working on **ESP32D** and **ESP32-S3 WROOM**.
+
+#### What works
+
+- **Captive portal** on first boot — connect phone, enter home WiFi credentials
+- **Auto‑reconnect** after reboot or power cycle
+- **Over‑the‑air (OTA) updates** using HTTP POST
+
+Here’s the auto‑reconnect logic I documented (love a good ASCII diagram):
+
+```
+ * AUTO-RECONNECT: HOW IT WORKS
+ * =============================================================================
+ * 
+ *     Boot
+ *      │
+ *      ▼
+ *     ┌───────────────────┐
+ *     │ Load creds from   │
+ *     │ NVS (if saved)    │
+ *     └────────┬──────────┘
+ *              │
+ *              ▼
+ *     ┌───────────────────┐     success    ┌──────────────────┐
+ *     │ Try to connect    │ ──────────────►│    CONNECTED     │
+ *     │ to saved AP       │                │  (got IP addr)   │
+ *     └────────┬──────────┘                └────────┬─────────┘
+ *              │ fail                               │
+ *              ▼                                    │ disconnect
+ *     ┌───────────────────┐                         │ event
+ *     │ Wait & retry      │◄───────────────────────┘
+ *     │ (backoff: 1→30s)  │
+ *     └────────┬──────────┘
+ *              │ max retries
+ *              ▼
+ *     ┌───────────────────┐
+ *     │ Start AP mode     │  ← Optional: captive portal fallback
+ *     │ for configuration │
+ *     └───────────────────┘
+ * 
+ * NVS (Non-Volatile Storage) persists credentials across reboots.
+ * The backoff increases delay between retries to avoid hammering the router.
+```
+
+#### OTA flashing
+
+Once the board is on the network, I can flash new firmware wirelessly:
+
+```powershell
+# Flash ESP32D
+curl.exe -X POST --data-binary "@.pio\build\esp32d\firmware.bin" -H "Content-Type: application/octet-stream" http://192.168.31.11/api/ota
+
+# Flash ESP32-S3 WROOM
+curl.exe -X POST --data-binary "@.pio\build\s3_wroom\firmware.bin" -H "Content-Type: application/octet-stream" http://192.168.31.205/api/ota
+```
+
+Both respond with `{"status":"ok","bytes":...,"message":"rebooting"}` — it’s **magical** to see code fly over the air.
+
+---
+
+## What I learned / observed
+
+- **Captive portal** is surprisingly simple with the right libraries (AsyncWebServer + DNSServer).
+- **NVS** is perfect for storing credentials — survives reboots, easy to read/write.
+- **OTA** needs a good chunk of free flash/partition; ESP32‑D and S3 have plenty.
+- The auto‑reconnect backoff is essential — without it, the board just hammers the router and makes things worse.
+- I still need to think about **security** (HTTPS? signed updates?) but that’s a polish‑stage problem.
+
+---
+
+## What’s next (immediate)
+
+Over the next few days I’ll work through the other wireless protocols in a similar way:
+
+1. **Bluetooth Low Energy (BLE)** — probably start with a simple beacon + UART‑like service.
+2. **ESP‑NOW** — peer‑to‑peer without WiFi, good for low‑power sensor networks.
+3. **Zigbee** — using the ESP32‑C6’s built‑in 802.15.4 radio.
+4. **LoRa** — external modules (Seeed LoRa boards I have).
+5. **OTA** — already have a taste, but need to explore more (e.g., serving updates from a server).
+
+The pattern will be the same:  
+build a minimal test → get it working on one board → test across the 5‑board set → document.
+
+---
+
+## Longer‑term thoughts
+
+- **Many boards talking together** — how do they discover each other? coordinate?
+- **OTA over the internet** — not just local network. That means a server, maybe MQTT, and secure updates.
+- **Security** — encryption, authentication, signed firmware. Probably overkill for now, but I want to understand it.
+
+But all that is for later. Right now I’m just happy that wireless is no longer a black box — I have a working WiFi/OTA setup and a clean folder structure to build on.
+
+---
+
+## Files produced / updated
+
+| Path | Description |
+|------|-------------|
+| `wireless/communication/wifi/` | WiFi driver + captive portal logic |
+| `wireless/testing/wifi-test/` | Test app for WiFi + OTA |
+| `wireless/communication/ota/` | Basic OTA handler (HTTP server endpoint) |
+| `wireless/testing/ota-test/` | (placeholder for future) |
+
+All existing component folders remain untouched — they’re my stable reference.
+
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
