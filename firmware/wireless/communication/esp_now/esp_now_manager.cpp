@@ -508,7 +508,7 @@ void EspNowManager::onSendStatic(const esp_now_send_info_t* tx_info,
          * We extract the success/fail from the legacy status parameter for 
          * backward compatibility, though tx_info->tx_status also works. */
         bool success = (status == ESP_NOW_SEND_SUCCESS);
-        mgr._send_cb(tx_info->dest_mac, success);
+        mgr._send_cb(tx_info->des_addr, success);
     }
 }
 
@@ -536,7 +536,7 @@ void EspNowManager::onRecvStatic(const esp_now_recv_info_t* recv_info,
         /* Can't use ESP_LOGW here safely in all contexts.
          * In practice this runs in a task context (not true ISR) so 
          * a brief log is usually okay, but we keep it minimal. */
-        ets_printf("ESP-NOW: RX queue full, message dropped!\n");
+        esp_rom_printf("ESP-NOW: RX queue full, message dropped!\n");
     }
 }
 
