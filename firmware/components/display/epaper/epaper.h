@@ -330,6 +330,71 @@ public:
 
 
     /**
+     * @brief Set display offset.
+     *
+     * @param x X offset (positive = shift right, negative = shift left).
+     * @param y Y offset (positive = shift down, negative = shift up).
+     *
+     * @details
+     * Shifts where content appears on the display. Useful for:
+     * - Compensating for physically misaligned panels
+     * - Centering content
+     * - Adjusting for bezels or enclosures
+     *
+     * @par Example:
+     * @code
+     *     display.setOffset(-5, 10);  // Left 5px, down 10px
+     * @endcode
+     */
+    void setOffset(int16_t x, int16_t y);
+
+
+    /**
+     * @brief Get current X offset.
+     */
+    int16_t getOffsetX() const;
+
+
+    /**
+     * @brief Get current Y offset.
+     */
+    int16_t getOffsetY() const;
+
+
+    /**
+     * @brief Partial refresh (update only a region).
+     *
+     * @param x Top-left X of region.
+     * @param y Top-left Y of region.
+     * @param w Width of region.
+     * @param h Height of region.
+     *
+     * @details
+     * Much faster than full update (~0.3 sec vs ~2 sec).
+     * Does not flash the screen.
+     *
+     * TRADEOFFS:
+     * - May leave ghosting after many partial updates
+     * - Do a full update() periodically to clear ghosting
+     * - Red pixels may not display correctly with partial refresh
+     *
+     * @par Example:
+     * @code
+     *     // Update just the clock area
+     *     display.fillRect(10, 100, 100, 30, EPAPER_WHITE);
+     *     display.drawString(10, 100, "12:34", EPAPER_BLACK);
+     *     display.partialUpdate(10, 100, 100, 30);
+     *     
+     *     // Every 10 updates, do full refresh to clear ghosting
+     *     if (updateCount % 10 == 0) {
+     *         display.update();
+     *     }
+     * @endcode
+     */
+    void partialUpdate(int16_t x, int16_t y, int16_t w, int16_t h);
+
+
+    /**
      * @brief Get display width (changes with rotation).
      */
     uint16_t getWidth() const { return width; }
@@ -360,6 +425,9 @@ private:
     uint8_t rotation;
     uint16_t width;
     uint16_t height;
+
+    int16_t xOffset;            // Display X offset (can be negative)
+    int16_t yOffset;            // Display Y offset (can be negative)
 
 
     /**

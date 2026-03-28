@@ -6,12 +6,12 @@
  * VERSION:     1.0.0
  * =============================================================================
  */
-
+#include "ble_manager.h"
 #include "ble_server.h"
 #include "esp_log.h"
 #include "host/ble_hs.h"
 #include "os/os_mbuf.h"
-
+#include "ble_manager.h"  
 static const char* TAG = "BLEServer";
 
 /* =============================================================================
@@ -221,6 +221,7 @@ esp_err_t BLEServer::buildServices() {
         ESP_LOGE(TAG, "GATT add services failed: %d", rc);
         return ESP_FAIL;
     }
+    ble_gatts_start();
 
     _built = true;
     ESP_LOGI(TAG, "GATT table built: %d services, %d characteristics",

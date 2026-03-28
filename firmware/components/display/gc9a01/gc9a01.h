@@ -387,6 +387,53 @@ public:
 
 
     /**
+     * @brief Enable partial display mode (only refresh a horizontal strip).
+     *
+     * @param startRow First row of partial area (0-239).
+     * @param endRow Last row of partial area (0-239).
+     *
+     * @details
+     * In partial mode, only the specified rows refresh. The rest of the
+     * display holds its content but doesn't update. This saves power
+     * when you only need to update part of the screen (like a status bar).
+     *
+     * @note
+     * - Drawing outside the partial area won't show until setNormalMode()
+     * - The partial area is always full width (round display limitation)
+     *
+     * @par Example:
+     * @code
+     *     // Only update bottom 40 pixels
+     *     display.setPartialArea(200, 239);
+     *     display.fillRect(0, 200, 240, 40, COLOR_BLACK);
+     *     display.drawString(10, 210, "Status", COLOR_WHITE);
+     *     
+     *     // Back to full screen updates
+     *     display.setNormalMode();
+     * @endcode
+     */
+    void setPartialArea(uint16_t startRow, uint16_t endRow);
+
+
+    /**
+     * @brief Return to normal full-display mode.
+     *
+     * @details
+     * Exits partial mode and resumes refreshing the entire display.
+     * Call this before updating areas outside the partial region.
+     */
+    void setNormalMode();
+
+
+    /**
+     * @brief Check if currently in partial display mode.
+     *
+     * @return true if partial mode active, false if normal mode.
+     */
+    bool isPartialMode() const;
+
+
+    /**
      * @brief Convert 24-bit RGB to RGB565.
      *
      * @param r Red (0-255).
@@ -412,6 +459,7 @@ private:
     uint8_t rotation;
     uint16_t width;
     uint16_t height;
+    bool partialMode;               // Track if partial mode is active
 
 
     /**

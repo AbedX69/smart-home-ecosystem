@@ -336,6 +336,93 @@ public:
 
 
     /**
+     * @brief Enable partial display mode (only refresh specified rows).
+     *
+     * @param startRow First row of partial area (0 to height-1).
+     * @param endRow Last row of partial area (0 to height-1).
+     *
+     * @details
+     * In partial mode, only the specified rows refresh. The rest of the
+     * display holds its content but doesn't update. Saves power when
+     * only part of the screen needs updating.
+     *
+     * @par Example:
+     * @code
+     *     display.setPartialArea(260, 279);  // Bottom 20 rows only
+     *     display.drawString(10, 265, "Status", COLOR_WHITE);
+     *     
+     *     display.setNormalMode();  // Back to full screen
+     * @endcode
+     */
+    void setPartialArea(uint16_t startRow, uint16_t endRow);
+
+
+    /**
+     * @brief Return to normal full-display mode.
+     */
+    void setNormalMode();
+
+
+    /**
+     * @brief Check if currently in partial display mode.
+     *
+     * @return true if partial mode active, false if normal mode.
+     */
+    bool isPartialMode() const;
+
+
+    /**
+     * @brief Set up hardware vertical scrolling.
+     *
+     * @param topFixedRows Rows at top that don't scroll (e.g., header).
+     * @param bottomFixedRows Rows at bottom that don't scroll (e.g., footer).
+     *
+     * @details
+     * Divides screen into three areas:
+     * - Top fixed (stays in place)
+     * - Scroll area (hardware-scrolled)
+     * - Bottom fixed (stays in place)
+     *
+     * @note ST7789 internal RAM is 320 rows. If your display is smaller
+     * (e.g., 280), the extra rows are hidden but still count.
+     *
+     * @par Example:
+     * @code
+     *     // 20px header, 20px footer, middle scrolls
+     *     display.setupScroll(20, 20);
+     *     
+     *     // Scroll content up by 16 pixels
+     *     display.scroll(16);
+     * @endcode
+     */
+    void setupScroll(uint16_t topFixedRows, uint16_t bottomFixedRows);
+
+
+    /**
+     * @brief Scroll display by offset.
+     *
+     * @param scrollOffset Pixels to scroll (wraps around).
+     *
+     * @note Call setupScroll() first to define scroll region.
+     */
+    void scroll(uint16_t scrollOffset);
+
+
+    /**
+     * @brief Stop scrolling and reset to normal display.
+     */
+    void stopScroll();
+
+
+    /**
+     * @brief Get height of scrollable area.
+     *
+     * @return Scroll area height in pixels.
+     */
+    uint16_t getScrollHeight() const;
+
+
+    /**
      * @brief Convert 24-bit RGB to RGB565.
      *
      * @param r Red (0-255).
@@ -378,6 +465,12 @@ private:
     uint8_t rotation;
     uint16_t width;     // Current width (may change with rotation)
     uint16_t height;    // Current height (may change with rotation)
+
+    bool partialMode;               // Track if partial mode is active
+    bool scrollEnabled;             // Track if scrolling is set up
+    uint16_t scrollTopFixed;        // Top fixed area height
+    uint16_t scrollBottomFixed;     // Bottom fixed area height
+    uint16_t scrollHeight;          // Scrollable area height
 
 
     /**

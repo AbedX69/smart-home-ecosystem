@@ -265,6 +265,58 @@ public:
 
 
     /**
+     * @brief Invert display colors.
+     *
+     * @param invert true = inverted, false = normal.
+     */
+    void setInverted(bool invert);
+
+
+    /**
+     * @brief Turn display on or off (sleep mode).
+     *
+     * @param on true = display on, false = sleep mode.
+     */
+    void setDisplayOn(bool on);
+
+
+    /**
+     * @brief Enable partial display mode (only refresh specified rows).
+     *
+     * @param startRow First row of partial area (0-63).
+     * @param endRow Last row of partial area (0-63).
+     *
+     * @details
+     * In partial mode, only the specified rows refresh. The rest of the
+     * display holds its content but doesn't update. Saves power when
+     * only part of the screen needs updating.
+     *
+     * @par Example:
+     * @code
+     *     display.setPartialArea(48, 63);  // Bottom 16 rows only
+     *     display.drawString(0, 50, "Hi", COLOR_WHITE);
+     *     
+     *     display.setNormalMode();  // Back to full screen
+     * @endcode
+     */
+    void setPartialArea(uint16_t startRow, uint16_t endRow);
+
+
+    /**
+     * @brief Return to normal full-display mode.
+     */
+    void setNormalMode();
+
+
+    /**
+     * @brief Check if currently in partial display mode.
+     *
+     * @return true if partial mode active, false if normal mode.
+     */
+    bool isPartialMode() const;
+
+
+    /**
      * @brief Convert 24-bit RGB to RGB565.
      *
      * @param r Red (0-255).
@@ -297,6 +349,7 @@ private:
     spi_host_device_t spiHost;
     spi_device_handle_t spiDevice;
     bool initialized;
+    bool partialMode;
 
 
     /**

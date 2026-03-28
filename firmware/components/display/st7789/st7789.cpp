@@ -278,7 +278,12 @@ ST7789::ST7789(uint16_t width, uint16_t height,
       spiHost(spiHost),
       spiDevice(nullptr),
       initialized(false),
-      rotation(0)
+      rotation(0),
+      partialMode(false),
+      scrollEnabled(false),
+      scrollTopFixed(0),
+      scrollBottomFixed(0),
+      scrollHeight(0)
 {
     this->width = width;
     this->height = height;
@@ -815,6 +820,164 @@ void ST7789::setRotation(uint8_t r) {
 
 void ST7789::setInverted(bool invert) {
     sendCommand(invert ? ST7789_INVON : ST7789_INVOFF);
+}
+
+
+/*
+ * =============================================================================
+ * PARTIAL DISPLAY MODE
+ * =============================================================================
+ * 
+ * Only refreshes specified rows. Rest of display holds content but doesn't
+ * update. Saves power when only part of screen changes.
+ * 
+ * EXAMPLE:
+ *     // Only update bottom status bar
+ *     display.setPartialArea(260, 279);
+ *     display.fillRect(0, 260, 240, 20, COLOR_BLACK);
+ *     display.drawString(10, 265, "12:34", COLOR_WHITE);
+ *     
+ *     display.setNormalMode();  // Back to full screen
+ */
+
+void ST7789::setPartialArea(uint16_t startRow, uint16_t endRow) {
+    // Clamp to valid range
+    if (startRow >= height) startRow = height - 1;
+    if (endRow >= height) endRow = height - 1;
+    if (startRow > endRow) {
+        uint16_t tmp = startRow;
+        startRow = endRow;
+        endRow = tmp;
+    }
+    
+    // Apply Y offset
+    startRow += yOffset;
+    endRow += yOffset;
+    
+    // Set partial area
+    sendCommand(ST7789_PTLAR);
+    sendData16(startRow);
+    sendData16(endRow);
+    
+    // Enable partial mode
+    sendCommand(ST7789_PTLON);
+    partialMode = true;
+    
+    ESP_LOGI(TAG, "Partial mode: rows %d-%d", startRow - yOffset, endRow - yOffset);
+}
+
+
+void ST7789::setNormalMode() {
+    sendCommand(ST7789_NORON);
+    partialMode = false;
+    ESP_LOGI(TAG, "Normal mode (full display)");
+}
+
+
+bool ST7789::isPartialMode() const {
+    return partialMode;
+}
+
+
+/*
+ * =============================================================================
+ * HARDWARE VERTICAL SCROLLING
+ * =============================================================================
+ * 
+ * The ST7789 can scroll content in hardware without redrawing — just shift
+ * which row of display RAM appears at the top of the screen.
+ * 
+ * MEMORY LAYOUT:
+ *     
+ *     ┌─────────────────────┐  ← Row 0 in RAM
+ *     │   Top Fixed Area    │  (doesn't scroll)
+ *     ├─────────────────────┤  ← scrollTopFixed
+ *     │                     │
+ *     │   Scrolling Area    │  (this part scrolls)
+ *     │                     │
+ *     ├─────────────────────┤  ← height - scrollBottomFixed
+ *     │  Bottom Fixed Area  │  (doesn't scroll)
+ *     └─────────────────────┘  ← Row 319 in RAM (max)
+ * 
+ * USE CASES:
+ *     - Terminal/log display (new lines push old ones up)
+ *     - Menu scrolling
+ *     - Ticker tape / marquee
+ * 
+ * EXAMPLE - Simple terminal:
+ *     
+ *     // Set up: 20px header, 20px footer, middle scrolls
+ *     display.setupScroll(20, 20);
+ *     
+ *     int scrollPos = 0;
+ *     while (true) {
+ *         // Write new line at bottom of scroll area
+ *         display.drawString(0, 260 - 20, "New log line", COLOR_WHITE);
+ *         
+ *         // Scroll up by 8 pixels (one text line)
+ *         scrollPos = (scrollPos + 8) % display.getScrollHeight();
+ *         display.scroll(scrollPos);
+ *         
+ *         vTaskDelay(pdMS_TO_TICKS(1000));
+ *     }
+ */
+
+void ST7789::setupScroll(uint16_t topFixedRows, uint16_t bottomFixedRows) {
+    // The scroll area is everything between top and bottom fixed areas
+    // ST7789 needs these to add up to 320 (its max height)
+    uint16_t maxHeight = 320;  // ST7789 internal RAM is always 320 rows
+    
+    if (topFixedRows + bottomFixedRows >= maxHeight) {
+        ESP_LOGE(TAG, "Invalid scroll setup: top + bottom >= 320");
+        return;
+    }
+    
+    scrollTopFixed = topFixedRows;
+    scrollBottomFixed = bottomFixedRows;
+    scrollHeight = maxHeight - topFixedRows - bottomFixedRows;
+    
+    // Send vertical scrolling definition
+    sendCommand(ST7789_VSCRDEF);
+    sendData16(topFixedRows);      // Top fixed area
+    sendData16(scrollHeight);      // Scroll area height
+    sendData16(bottomFixedRows);   // Bottom fixed area
+    
+    scrollEnabled = true;
+    
+    ESP_LOGI(TAG, "Scroll setup: top=%d, scroll=%d, bottom=%d", 
+             topFixedRows, scrollHeight, bottomFixedRows);
+}
+
+
+void ST7789::scroll(uint16_t scrollOffset) {
+    if (!scrollEnabled) {
+        ESP_LOGW(TAG, "Call setupScroll() before scroll()");
+        return;
+    }
+    
+    // Wrap offset to scroll area
+    scrollOffset = scrollOffset % scrollHeight;
+    
+    // Add top fixed area offset
+    uint16_t startLine = scrollTopFixed + scrollOffset;
+    
+    sendCommand(ST7789_VSCRSADD);
+    sendData16(startLine);
+}
+
+
+void ST7789::stopScroll() {
+    // Reset to no scrolling (line 0 at top)
+    sendCommand(ST7789_VSCRSADD);
+    sendData16(0);
+    
+    scrollEnabled = false;
+    ESP_LOGI(TAG, "Scrolling stopped");
+}
+
+
+uint16_t ST7789::getScrollHeight() const {
+    return scrollHeight;
 }
 
 

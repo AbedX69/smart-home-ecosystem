@@ -25,7 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-
+#include "esp_random.h"
 #include "ble_manager.h"
 #include "ble_server.h"
 #include "ble_client.h"
@@ -251,13 +251,14 @@ extern "C" void app_main(void) {
                               BLE_GATT_CHR_F_READ,
                               (uint8_t*)name_value, strlen(name_value),
                               sizeof(name_value), &name_handle);
-    server.buildServices();
 
     /* Now start BLE */
     ble.begin(BLE_DEVICE_NAME);
 
     /* Wait for stack sync, then start advertising */
     vTaskDelay(pdMS_TO_TICKS(500));
+    server.buildServices();
+
     ble.startAdvertising();
 
     /* Simulate temperature changes and notify */
@@ -346,3 +347,4 @@ extern "C" void app_main(void) {
     }
 #endif
 }
+  

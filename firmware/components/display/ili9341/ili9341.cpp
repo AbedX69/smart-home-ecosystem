@@ -194,7 +194,14 @@ ILI9341::ILI9341(gpio_num_t mosiPin, gpio_num_t misoPin, gpio_num_t sckPin,
       initialized(false),
       rotation(0),
       width(ILI9341_WIDTH),
-      height(ILI9341_HEIGHT)
+      height(ILI9341_HEIGHT),
+      xOffset(0),
+      yOffset(0),
+      partialMode(false),
+      scrollEnabled(false),
+      scrollTopFixed(0),
+      scrollBottomFixed(0),
+      scrollHeight(0)
 {
 }
 
@@ -490,6 +497,12 @@ void ILI9341::sendData16(uint16_t data) {
 
 
 void ILI9341::setWindow(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+    // Apply offsets (can be negative for shifting content)
+    x0 += xOffset;
+    x1 += xOffset;
+    y0 += yOffset;
+    y1 += yOffset;
+
     sendCommand(ILI9341_CASET);
     sendData16(x0);
     sendData16(x1);
@@ -817,6 +830,274 @@ void ILI9341::setRotation(uint8_t r) {
 
 void ILI9341::setInverted(bool invert) {
     sendCommand(invert ? ILI9341_INVON : ILI9341_INVOFF);
+}
+
+
+/*
+ * =============================================================================
+ * DISPLAY OFFSET
+ * =============================================================================
+ * 
+ * Shifts where content appears on the display. Useful for:
+ *     - Cheap modules where the panel is physically misaligned
+ *     - Centering smaller content on the screen
+ *     - Adjusting for bezels or enclosures
+ * 
+ * COORDINATE SYSTEM:
+ *     
+ *     Positive xOffset → content shifts RIGHT
+ *     Negative xOffset → content shifts LEFT
+ *     Positive yOffset → content shifts DOWN
+ *     Negative yOffset → content shifts UP
+ *     
+ *                        -yOffset
+ *                           ▲
+ *                           │
+ *            -xOffset ◄─────┼─────► +xOffset
+ *                           │
+ *                           ▼
+ *                        +yOffset
+ * 
+ * EXAMPLE - Panel is shifted 10px too far right:
+ *     
+ *     display.setOffset(-10, 0);  // Shift content left to compensate
+ * 
+ * EXAMPLE - Center a 200x200 area on 240x320 display:
+ *     
+ *     display.setOffset(20, 60);  // (240-200)/2 = 20, (320-200)/2 = 60
+ * 
+ * WARNING:
+ *     - Content drawn outside visible area is clipped
+ *     - Offset applies to ALL drawing operations
+ *     - Negative offsets may cause content to wrap or be cut off
+ */
+
+void ILI9341::setOffset(int16_t x, int16_t y) {
+    xOffset = x;
+    yOffset = y;
+    ESP_LOGI(TAG, "Display offset set to (%d, %d)", x, y);
+}
+
+
+int16_t ILI9341::getOffsetX() const {
+    return xOffset;
+}
+
+
+int16_t ILI9341::getOffsetY() const {
+    return yOffset;
+}
+
+
+/*
+ * =============================================================================
+ * PARTIAL DISPLAY MODE
+ * =============================================================================
+ * 
+ * Only refreshes specified rows. Rest of display holds content but doesn't
+ * update. Saves power when only part of screen changes (e.g., status bar).
+ * 
+ * HOW IT WORKS:
+ *     
+ *     Normal mode:              Partial mode (rows 280-319):
+ *     ┌────────────────────┐    ┌────────────────────┐
+ *     │                    │    │                    │
+ *     │   All rows         │    │   Frozen           │
+ *     │   refreshing       │    │   (holds content)  │
+ *     │   (~60 FPS)        │    │                    │
+ *     │                    │    ├────────────────────┤
+ *     │                    │    │ REFRESHING         │
+ *     │                    │    │ (status bar)       │
+ *     └────────────────────┘    └────────────────────┘
+ * 
+ * EXAMPLE - Status bar at bottom:
+ *     
+ *     // Only refresh bottom 40 pixels
+ *     display.setPartialArea(280, 319);
+ *     
+ *     // Update status bar (only this area refreshes)
+ *     display.fillRect(0, 280, 240, 40, COLOR_BLACK);
+ *     display.drawString(10, 290, "12:34 PM", COLOR_WHITE);
+ *     
+ *     // Return to full screen mode
+ *     display.setNormalMode();
+ * 
+ * NOTE:
+ *     - Drawing outside partial area won't show until setNormalMode()
+ *     - Partial area is horizontal strip (full width)
+ *     - Good for: clocks, status bars, progress indicators
+ */
+
+void ILI9341::setPartialArea(uint16_t startRow, uint16_t endRow) {
+    // Clamp to valid range
+    if (startRow >= height) startRow = height - 1;
+    if (endRow >= height) endRow = height - 1;
+    if (startRow > endRow) {
+        uint16_t tmp = startRow;
+        startRow = endRow;
+        endRow = tmp;
+    }
+    
+    // Apply Y offset
+    startRow += yOffset;
+    endRow += yOffset;
+    
+    // Set partial area
+    sendCommand(ILI9341_PTLAR);
+    sendData16(startRow);
+    sendData16(endRow);
+    
+    // Enable partial mode
+    sendCommand(ILI9341_PTLON);
+    partialMode = true;
+    
+    ESP_LOGI(TAG, "Partial mode: rows %d-%d", startRow - yOffset, endRow - yOffset);
+}
+
+
+void ILI9341::setNormalMode() {
+    sendCommand(ILI9341_NORON);
+    partialMode = false;
+    ESP_LOGI(TAG, "Normal mode (full display)");
+}
+
+
+bool ILI9341::isPartialMode() const {
+    return partialMode;
+}
+
+
+/*
+ * =============================================================================
+ * HARDWARE VERTICAL SCROLLING
+ * =============================================================================
+ * 
+ * The ILI9341 can scroll content in hardware — no redrawing needed!
+ * Just changes which row of display RAM appears at top of screen.
+ * 
+ * MEMORY LAYOUT:
+ *     
+ *     ┌─────────────────────┐  ← Row 0 in RAM
+ *     │   Top Fixed Area    │  (header - doesn't scroll)
+ *     │   (topFixedRows)    │
+ *     ├─────────────────────┤
+ *     │                     │
+ *     │   Scrolling Area    │  ← This part scrolls
+ *     │   (scrollHeight)    │    Content wraps around
+ *     │                     │
+ *     ├─────────────────────┤
+ *     │  Bottom Fixed Area  │  (footer - doesn't scroll)
+ *     │  (bottomFixedRows)  │
+ *     └─────────────────────┘  ← Row 319 in RAM
+ * 
+ * HOW SCROLLING WORKS:
+ *     
+ *     scroll(0):           scroll(16):          scroll(32):
+ *     ┌──────────┐         ┌──────────┐         ┌──────────┐
+ *     │ HEADER   │         │ HEADER   │         │ HEADER   │
+ *     ├──────────┤         ├──────────┤         ├──────────┤
+ *     │ Line 1   │         │ Line 3   │         │ Line 5   │
+ *     │ Line 2   │         │ Line 4   │         │ Line 6   │
+ *     │ Line 3   │   →     │ Line 5   │   →     │ Line 7   │
+ *     │ Line 4   │         │ Line 6   │         │ Line 8   │
+ *     │ Line 5   │         │ Line 7   │         │ Line 1   │ ← wrapped
+ *     │ Line 6   │         │ Line 8   │         │ Line 2   │
+ *     ├──────────┤         ├──────────┤         ├──────────┤
+ *     │ FOOTER   │         │ FOOTER   │         │ FOOTER   │
+ *     └──────────┘         └──────────┘         └──────────┘
+ * 
+ * USE CASES:
+ *     - Terminal/console output (logs scroll up)
+ *     - Chat messages
+ *     - Menu scrolling
+ *     - Ticker tape / news marquee
+ * 
+ * EXAMPLE - Terminal with header/footer:
+ *     
+ *     // 20px header, 20px footer, middle scrolls
+ *     display.setupScroll(20, 20);
+ *     
+ *     int scrollPos = 0;
+ *     int lineY = 20;  // First line position
+ *     
+ *     while (true) {
+ *         // Draw new log line
+ *         display.fillRect(0, lineY, 240, 16, COLOR_BLACK);
+ *         display.drawString(0, lineY, "New log entry", COLOR_GREEN);
+ *         
+ *         // Scroll up
+ *         scrollPos = (scrollPos + 16) % display.getScrollHeight();
+ *         display.scroll(scrollPos);
+ *         
+ *         // Move line position (wraps in scroll area)
+ *         lineY += 16;
+ *         if (lineY >= 300) lineY = 20;
+ *         
+ *         vTaskDelay(pdMS_TO_TICKS(500));
+ *     }
+ * 
+ * IMPORTANT:
+ *     - ILI9341 RAM is always 320 rows
+ *     - topFixedRows + scrollHeight + bottomFixedRows MUST equal 320
+ *     - Scrolling is instant (hardware does it)
+ */
+
+void ILI9341::setupScroll(uint16_t topFixedRows, uint16_t bottomFixedRows) {
+    // ILI9341 internal RAM is always 320 rows
+    const uint16_t maxHeight = 320;
+    
+    if (topFixedRows + bottomFixedRows >= maxHeight) {
+        ESP_LOGE(TAG, "Invalid scroll setup: top(%d) + bottom(%d) >= 320", 
+                 topFixedRows, bottomFixedRows);
+        return;
+    }
+    
+    scrollTopFixed = topFixedRows;
+    scrollBottomFixed = bottomFixedRows;
+    scrollHeight = maxHeight - topFixedRows - bottomFixedRows;
+    
+    // Send vertical scrolling definition
+    sendCommand(ILI9341_VSCRDEF);
+    sendData16(topFixedRows);       // Top fixed area
+    sendData16(scrollHeight);       // Scroll area height  
+    sendData16(bottomFixedRows);    // Bottom fixed area
+    
+    scrollEnabled = true;
+    
+    ESP_LOGI(TAG, "Scroll setup: top=%d, scroll=%d, bottom=%d", 
+             topFixedRows, scrollHeight, bottomFixedRows);
+}
+
+
+void ILI9341::scroll(uint16_t scrollOffset) {
+    if (!scrollEnabled) {
+        ESP_LOGW(TAG, "Call setupScroll() before scroll()");
+        return;
+    }
+    
+    // Wrap offset to scroll area
+    scrollOffset = scrollOffset % scrollHeight;
+    
+    // Add top fixed area offset
+    uint16_t startLine = scrollTopFixed + scrollOffset;
+    
+    sendCommand(ILI9341_VSCRSADD);
+    sendData16(startLine);
+}
+
+
+void ILI9341::stopScroll() {
+    // Reset to no scrolling (line 0 at top)
+    sendCommand(ILI9341_VSCRSADD);
+    sendData16(0);
+    
+    scrollEnabled = false;
+    ESP_LOGI(TAG, "Scrolling stopped");
+}
+
+
+uint16_t ILI9341::getScrollHeight() const {
+    return scrollHeight;
 }
 
 

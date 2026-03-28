@@ -104,7 +104,7 @@ esp_err_t BLEManager::begin(const char* device_name) {
     ble_hs_cfg.sm_sc = 1;                            // Secure connections
 
     /* Store config for bonding persistence */
-    ble_store_config_init();
+   // ble_store_config_init();
 
     /* ── Start NimBLE host task ────────────────────────────────────── */
     nimble_port_freertos_init(nimbleHostTask);

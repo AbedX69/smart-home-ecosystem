@@ -358,6 +358,129 @@ public:
 
 
     /**
+     * @brief Set display memory offset.
+     *
+     * @param x X offset (positive = shift right, negative = shift left).
+     * @param y Y offset (positive = shift down, negative = shift up).
+     *
+     * @details
+     * Shifts where content appears on the display. Useful for:
+     * - Compensating for physically misaligned panels
+     * - Centering content
+     * - Adjusting for bezels or enclosures
+     *
+     * @par Example:
+     * @code
+     *     // Panel is mounted 10px too far right
+     *     display.setOffset(-10, 0);
+     *     
+     *     // Center 200x200 content on 240x320 display
+     *     display.setOffset(20, 60);
+     * @endcode
+     */
+    void setOffset(int16_t x, int16_t y);
+
+
+    /**
+     * @brief Get current X offset.
+     */
+    int16_t getOffsetX() const;
+
+
+    /**
+     * @brief Get current Y offset.
+     */
+    int16_t getOffsetY() const;
+
+
+    /**
+     * @brief Enable partial display mode (only refresh specified rows).
+     *
+     * @param startRow First row of partial area (0 to height-1).
+     * @param endRow Last row of partial area (0 to height-1).
+     *
+     * @details
+     * In partial mode, only the specified rows refresh. The rest of the
+     * display holds its content but doesn't update. Saves power when
+     * only part of the screen needs updating (e.g., status bar).
+     *
+     * @par Example:
+     * @code
+     *     display.setPartialArea(280, 319);  // Bottom 40 rows only
+     *     display.drawString(10, 290, "Status", COLOR_WHITE);
+     *     
+     *     display.setNormalMode();  // Back to full screen
+     * @endcode
+     */
+    void setPartialArea(uint16_t startRow, uint16_t endRow);
+
+
+    /**
+     * @brief Return to normal full-display mode.
+     */
+    void setNormalMode();
+
+
+    /**
+     * @brief Check if currently in partial display mode.
+     *
+     * @return true if partial mode active, false if normal mode.
+     */
+    bool isPartialMode() const;
+
+
+    /**
+     * @brief Set up hardware vertical scrolling.
+     *
+     * @param topFixedRows Rows at top that don't scroll (e.g., header).
+     * @param bottomFixedRows Rows at bottom that don't scroll (e.g., footer).
+     *
+     * @details
+     * Divides screen into three areas:
+     * - Top fixed (stays in place)
+     * - Scroll area (hardware-scrolled, content wraps)
+     * - Bottom fixed (stays in place)
+     *
+     * @note ILI9341 internal RAM is always 320 rows.
+     * topFixedRows + scrollArea + bottomFixedRows must equal 320.
+     *
+     * @par Example:
+     * @code
+     *     // 20px header, 20px footer, middle scrolls
+     *     display.setupScroll(20, 20);
+     *     
+     *     // Scroll content up by 16 pixels
+     *     display.scroll(16);
+     * @endcode
+     */
+    void setupScroll(uint16_t topFixedRows, uint16_t bottomFixedRows);
+
+
+    /**
+     * @brief Scroll display by offset.
+     *
+     * @param scrollOffset Pixels to scroll (wraps around scroll area).
+     *
+     * @note Call setupScroll() first to define scroll region.
+     */
+    void scroll(uint16_t scrollOffset);
+
+
+    /**
+     * @brief Stop scrolling and reset to normal display.
+     */
+    void stopScroll();
+
+
+    /**
+     * @brief Get height of scrollable area.
+     *
+     * @return Scroll area height in pixels.
+     */
+    uint16_t getScrollHeight() const;
+
+
+    /**
      * @brief Convert 24-bit RGB to RGB565.
      *
      * @param r Red (0-255).
@@ -396,6 +519,14 @@ private:
     uint8_t rotation;
     uint16_t width;
     uint16_t height;
+
+    int16_t xOffset;                // Display X offset (can be negative)
+    int16_t yOffset;                // Display Y offset (can be negative)
+    bool partialMode;               // Track if partial mode is active
+    bool scrollEnabled;             // Track if scrolling is set up
+    uint16_t scrollTopFixed;        // Top fixed area height
+    uint16_t scrollBottomFixed;     // Bottom fixed area height
+    uint16_t scrollHeight;          // Scrollable area height
 
 
     /**
