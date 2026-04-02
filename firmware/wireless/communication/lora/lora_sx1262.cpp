@@ -160,6 +160,32 @@ void LoRaSX1262::writeRegister(uint16_t addr, const uint8_t* data, uint8_t len) 
     xSemaphoreGive(_spi_mutex);
 }
 
+
+void LoRaSX1262::setDio3AsTcxoCtrl(float voltage, uint32_t timeout_ms) {
+    // Convert voltage to register value
+    // 1.6V=0x00, 1.7V=0x01, 1.8V=0x02, 2.2V=0x03, 2.4V=0x04, 2.7V=0x05, 3.0V=0x06, 3.3V=0x07
+    uint8_t volt_val;
+    if (voltage < 1.65f) volt_val = 0x00;
+    else if (voltage < 1.75f) volt_val = 0x01;
+    else if (voltage < 2.0f) volt_val = 0x02;   // 1.8V
+    else if (voltage < 2.3f) volt_val = 0x03;
+    else if (voltage < 2.55f) volt_val = 0x04;
+    else if (voltage < 2.85f) volt_val = 0x05;
+    else if (voltage < 3.15f) volt_val = 0x06;
+    else volt_val = 0x07;
+
+    // Timeout in 15.625us steps
+    uint32_t timeout = (uint32_t)((float)timeout_ms * 64.0f);
+    
+    uint8_t params[4];
+    params[0] = volt_val;
+    params[1] = (timeout >> 16) & 0xFF;
+    params[2] = (timeout >> 8) & 0xFF;
+    params[3] = timeout & 0xFF;
+    spiWrite(SX1262_CMD_SET_DIO3_AS_TCXO, params, 4);
+}
+
+
 void LoRaSX1262::readRegister(uint16_t addr, uint8_t* data, uint8_t len) {
     waitBusy();
     xSemaphoreTake(_spi_mutex, portMAX_DELAY);
@@ -435,6 +461,17 @@ esp_err_t LoRaSX1262::begin(const LoRaPins& pins, const LoRaConfig& config) {
     io_conf.intr_type = GPIO_INTR_POSEDGE;
     gpio_config(&io_conf);
 
+    /* TXEN, RXEN: output (if used) */
+    if (_pins.txen >= 0) {
+        gpio_reset_pin((gpio_num_t)_pins.txen);
+        gpio_set_direction((gpio_num_t)_pins.txen, GPIO_MODE_INPUT_OUTPUT);
+        gpio_set_level((gpio_num_t)_pins.txen, 0);
+    }
+    if (_pins.rxen >= 0) {
+        gpio_reset_pin((gpio_num_t)_pins.rxen);
+        gpio_set_direction((gpio_num_t)_pins.rxen, GPIO_MODE_INPUT_OUTPUT);
+        gpio_set_level((gpio_num_t)_pins.rxen, 0);
+    }
     /* ── Initialize SPI bus ────────────────────────────────────────── */
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = _pins.mosi;
@@ -470,7 +507,16 @@ esp_err_t LoRaSX1262::begin(const LoRaPins& pins, const LoRaConfig& config) {
 
     /* ── Configure SX1262 ──────────────────────────────────────────── */
     reset();
+    // Enable TCXO with 1.8V (required for Wio-SX1262)
+    setDio3AsTcxoCtrl(1.8f, 10);  // 1.8V, 10ms timeout
+    vTaskDelay(pdMS_TO_TICKS(10));
     setStandby(0x00);  // STDBY_RC
+
+
+    // ← ADD THIS: full recalibration after TCXO is active
+    uint8_t calib_all = 0x7F;
+    spiWrite(SX1262_CMD_CALIBRATE, &calib_all, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* Regulator: DC-DC or LDO */
     setRegulatorMode(_config.use_dcdc ? 0x01 : 0x00);
@@ -600,6 +646,8 @@ esp_err_t LoRaSX1262::send(const uint8_t* data, uint8_t length, uint32_t timeout
     params[0] = (timeout_rtc >> 16) & 0xFF;
     params[1] = (timeout_rtc >> 8) & 0xFF;
     params[2] = timeout_rtc & 0xFF;
+    if (_pins.txen >= 0) gpio_set_level((gpio_num_t)_pins.txen, 1);
+    if (_pins.rxen >= 0) gpio_set_level((gpio_num_t)_pins.rxen, 0);
     spiWrite(SX1262_CMD_SET_TX, params, 3);
 
     ESP_LOGD(TAG, "TX: %d bytes", length);
@@ -636,9 +684,15 @@ esp_err_t LoRaSX1262::startReceive() {
 
     /* Enter continuous RX: timeout = 0xFFFFFF */
     uint8_t params[3] = {0xFF, 0xFF, 0xFF};
+    if (_pins.rxen >= 0) gpio_set_level((gpio_num_t)_pins.rxen, 1);
+    if (_pins.txen >= 0) gpio_set_level((gpio_num_t)_pins.txen, 0);
     spiWrite(SX1262_CMD_SET_RX, params, 3);
 
+    uint8_t gain = 0x96;
+    writeRegister(0x08AC, &gain, 1);
     ESP_LOGI(TAG, "Continuous RX started");
+    ESP_LOGI(TAG, "DIO1 pin: %d, IRQ mask enabled", _pins.dio1);
+
     return ESP_OK;
 }
 
@@ -662,6 +716,8 @@ esp_err_t LoRaSX1262::receiveOnce(uint32_t timeout_ms) {
     params[0] = (timeout_rtc >> 16) & 0xFF;
     params[1] = (timeout_rtc >> 8) & 0xFF;
     params[2] = timeout_rtc & 0xFF;
+    if (_pins.rxen >= 0) gpio_set_level((gpio_num_t)_pins.rxen, 1);
+    if (_pins.txen >= 0) gpio_set_level((gpio_num_t)_pins.txen, 0);
     spiWrite(SX1262_CMD_SET_RX, params, 3);
 
     return ESP_OK;

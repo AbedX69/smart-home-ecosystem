@@ -974,6 +974,105 @@ All existing component folders remain untouched — they’re my stable referenc
 
 
 
+Dev Log — LoRa SX1262 Debugging
+Date: 02/04/2026
+Component: LoRa SX1262 (Seeed Wio-SX1262 + XIAO ESP32-S3, B2B connector kit)
+Goal: Get two boards talking — one TX beacon, one RX gateway.
+
+Setup
+Two identical XIAO ESP32-S3 + Wio-SX1262 B2B kits.
+Both have antennas connected, 4 meters apart (wall in between).
+DeviceCOM PortMACFirmwareTX (Sensor Beacon)COM9b8:f8:62:f9:fa:c8-DLORA_TEST_TXRX (Gateway)COM6b8:f8:62:f8:b7:d8-DLORA_TEST_RX
+LoRa config: 915 MHz, SF7, 125 kHz BW, CR 4/5, sync word 0x12, CRC on, 22 dBm TX power.
+
+The Problem
+TX reports "Beacon transmitted" every 5 seconds — looks fine.
+RX initializes, enters continuous RX, but never receives a single packet.
+No IRQ activity, no DIO1 toggles, nothing.
+
+The Debugging Journey
+Attempt 1: Missing full calibration after TCXO enable
+Theory: The Wio-SX1262 uses an external TCXO (controlled via DIO3). After reset, the chip auto-calibrates using its internal RC oscillator, but that happens before we enable the TCXO. So the calibration runs against the wrong clock source.
+Fix applied:
+cpp// In begin(), after TCXO setup:
+uint8_t calib_all = 0x7F;
+spiWrite(SX1262_CMD_CALIBRATE, &calib_all, 1);
+vTaskDelay(pdMS_TO_TICKS(10));
+Result: Still no RX. Good practice to keep though.
+
+Attempt 2: Missing TXEN/RXEN pin control
+Theory (from Arduino reference code): The working Arduino examples for this exact kit use GPIO 43 (TXEN) and GPIO 44 (RXEN) to control the RF antenna switch. My driver only used setDio2AsRfSwitch(true), which toggles a different pin (DIO2) that this module doesn't wire to the switch.
+Without RXEN being driven HIGH, the antenna switch never routes RF to the receiver.
+Fix applied:
+
+Added txen and rxen fields to LoRaPins struct
+Updated XIAO_S3_WIO_B2B preset: .txen = 43, .rxen = 44
+In send(): set TXEN=1, RXEN=0 before SET_TX
+In startReceive() / receiveOnce(): set RXEN=1, TXEN=0 before SET_RX
+Set use_dio2_rf_sw = false (default) since we use external TXEN/RXEN
+
+Result: Still no RX.
+
+Attempt 3: GPIO 43/44 stuck as UART pins
+Theory: GPIO 43 and 44 are UART0 TX/RX by default on ESP32-S3. In ESP-IDF, gpio_set_direction() alone doesn't detach them from the UART peripheral — unlike Arduino's pinMode() which calls gpio_reset_pin() internally.
+Fix applied:
+cppif (_pins.txen >= 0) {
+    gpio_reset_pin((gpio_num_t)_pins.txen);
+    gpio_set_direction((gpio_num_t)_pins.txen, GPIO_MODE_INPUT_OUTPUT);
+    gpio_set_level((gpio_num_t)_pins.txen, 0);
+}
+if (_pins.rxen >= 0) {
+    gpio_reset_pin((gpio_num_t)_pins.rxen);
+    gpio_set_direction((gpio_num_t)_pins.rxen, GPIO_MODE_INPUT_OUTPUT);
+    gpio_set_level((gpio_num_t)_pins.rxen, 0);
+}
+Result: Still no RX. But diagnostic logging now confirmed RXEN=1 and TXEN=0 during receive — the pins were actually working.
+
+Attempt 4: Swap boards to isolate hardware vs software
+Flashed TX firmware on the RX board and vice versa.
+Result: Both boards transmit fine, neither receives. Confirmed it's a software bug, not a dead board.
+
+Attempt 5: Add RSSI diagnostic
+Added lora.getRSSI() to the RX polling loop to check if the chip is actually in RX mode.
+Result: RSSI = -110 dBm (noise floor). Chip IS in RX mode, hearing background noise, but seeing zero signal from the TX 4 meters away. This means TX is not actually radiating RF — the TX_DONE IRQ fires because the state machine completes, not because RF went out.
+
+Attempt 6 (THE FIX): Wrong bandwidth register value
+Root cause found.
+In main.cpp:
+cppconfig.bandwidth = 7;    // I thought 7 = 125 kHz
+The comment in the header said 7=125k — but that's the SX1276 mapping (old chip, register-based). The SX1262 uses completely different values:
+SX1262 ValueBandwidth07.81 kHz115.63 kHz231.25 kHz362.50 kHz4125 kHz5250 kHz6500 kHz
+Value 7 is undefined. The chip accepted the command without error, TX_DONE fired normally, but the RF modulation was garbage — no valid LoRa signal was emitted.
+Fix:
+cppconfig.bandwidth = 4;    // 125 kHz (SX1262 register value)
+And fixed the header comment:
+cppuint8_t bandwidth = 4;   ///< 0=7.81k 1=15.63k 2=31.25k 3=62.5k 4=125k 5=250k 6=500k
+Result: Packets received immediately. RSSI -69 to -77 dBm, SNR 12-13 dB, 100% packet reception.
+
+Final Working Output
+I (6164) LoRaSX1262: RX: 8 bytes, RSSI=-72 dBm, SNR=12 dB
+I (6164) LoRaTest: ╔═══════════ PACKET #1 ═══════════╗
+I (6164) LoRaTest: ║  Length: 8 bytes
+I (6174) LoRaTest: ║  RSSI:  -72 dBm
+I (6174) LoRaTest: ║  SNR:   12 dB
+I (6174) LoRaTest: ║  Type:  SENSOR (0x01)
+I (6184) LoRaTest: ║  Node:  1
+I (6184) LoRaTest: ║  Seq:   18
+I (6184) LoRaTest: ║  Temp:  25.3°C
+I (6194) LoRaTest: ║  Hum:   59.8%
+I (6194) LoRaTest: ╚══════════════════════════════════╝
+
+All Changes Made to the Driver
+#FileChangeWhy1lora_sx1262.hAdded txen, rxen to LoRaPins structRF switch needs external GPIO control2lora_sx1262.hUpdated XIAO_S3_WIO_B2B preset with .txen=43, .rxen=44Correct pins for this kit3lora_sx1262.hAdded .txen=-1, .rxen=-1 to EDGE and CUSTOM presetsPrevent compile errors4lora_sx1262.hChanged use_dio2_rf_sw default to falseB2B kit uses TXEN/RXEN, not DIO25lora_sx1262.hFixed bandwidth commentOld comment had SX1276 mapping, not SX12626lora_sx1262.cppAdded gpio_reset_pin() + GPIO_MODE_INPUT_OUTPUT for TXEN/RXEN in begin()GPIO 43/44 default to UART0 on ESP32-S37lora_sx1262.cppAdded TXEN/RXEN toggling in send(), startReceive(), receiveOnce()Control RF switch direction8lora_sx1262.cppAdded full calibration (0x7F) after TCXO enable in begin()Recalibrate with correct clock source9lora_sx1262.cppAdded RX boosted gain (0x96 to register 0x08AC) in startReceive()Better receive sensitivity10main.cppChanged config.bandwidth = 7 → config.bandwidth = 4THE ROOT CAUSE — 7 is invalid for SX1262
+
+Key Takeaways
+
+SX1262 ≠ SX1276 register values. The bandwidth index mapping is completely different between the two chips. Don't copy SX1276 documentation into SX1262 code.
+TX_DONE doesn't mean RF was transmitted. The SX1262 fires TX_DONE when its state machine finishes, regardless of whether valid RF was emitted. An invalid bandwidth value produces no usable signal but still reports success.
+RSSI diagnostic is powerful. Reading instantaneous RSSI during RX confirmed the chip was listening but hearing nothing — proving the problem was on the TX side, not RX.
+GPIO 43/44 on ESP32-S3 need gpio_reset_pin() before use as GPIO. They're UART0 by default and gpio_set_direction() alone doesn't detach them from the peripheral.
+The Wio-SX1262 B2B kit uses TXEN/RXEN (GPIO 43/44), not DIO2, for RF switch control. The Arduino reference code showed this clearly — should have checked it first.
+Swapping boards is the fastest way to isolate hardware vs software. One test proved both boards were fine and the bug was in code.
 
 
 
@@ -982,7 +1081,147 @@ All existing component folders remain untouched — they’re my stable referenc
 
 
 
+LoRa (SX1262) – point‑to‑point sensor beacon + gateway.
 
+BLE (NimBLE) – scanner, server, client, and Web Bluetooth dashboard.
+
+Hardware:
+
+2× XIAO ESP32‑S3 + Wio‑SX1262 B2B kits (LoRa tests)
+
+1× ESP32‑D + 1× XIAO ESP32‑S3 (BLE tests)
+
+All antennas attached.
+
+1. LoRa – Root Cause & Fix
+Problem
+TX device reported “Beacon transmitted” every 5 seconds, but RX gateway never received anything.
+getRSSI() on the gateway showed noise floor (–110 dBm), confirming the TX was not radiating a valid LoRa signal.
+
+Investigation
+Swapped TX / RX boards → both transmitted fine, neither received.
+
+Conclusion: software bug on TX side, not hardware.
+
+Added TXEN/RXEN GPIO control (43/44) and gpio_reset_pin() because these pins default to UART0 on ESP32‑S3.
+
+Enabled full calibration after TCXO start.
+
+Still no packets.
+
+The Fix
+Wrong bandwidth register value for SX1262.
+The header comment had SX1276 mapping (7=125 kHz), but SX1262 uses a different table:
+
+SX1262 value	Bandwidth
+4	125 kHz
+5	250 kHz
+6	500 kHz
+The code used bandwidth = 7 – an invalid value. The chip accepted the command, completed its state machine, and fired TX_DONE, but emitted no usable RF.
+
+Fix:
+
+cpp
+config.bandwidth = 4;   // 125 kHz (SX1262)
+After change – packets received immediately with RSSI –69 to –77 dBm, SNR 12‑13 dB.
+
+2. BLE – Full Stack Validation
+2.1 Scanner Mode (First test)
+Build flag: -DBLE_TEST_SCANNER
+
+Result: ESP32 found nearby BLE devices (phone, smartwatch).
+
+Confirmed NimBLE stack works and hardware BLE is functional.
+
+2.2 Server Mode (Peripheral)
+Build flag: -DBLE_TEST_SERVER
+
+Added GATT service (12345678-1234-1234-1234-123456789ABC) with three characteristics:
+
+Temperature (read/notify)
+
+LED (write)
+
+Device Name (read)
+
+Initial crash due to buildServices() called before ble.begin().
+Fix: Move buildServices() after begin() + add ble_gatts_start() in buildServices().
+
+After fix, advertising started successfully.
+
+2.3 Web Bluetooth Dashboard
+Created HTML page using Web Bluetooth API.
+
+Initial connection succeeded but service discovery failed – services were not included in advertisement.
+
+Workaround: request all services and iterate.
+
+Final dashboard:
+
+Connect / disconnect
+
+Read temperature (live via notifications)
+
+Turn LED on/off
+
+Read device name
+
+Log shows clean interaction:
+
+text
+Got service: 12345678-1234-1234-1234-123456789abc
+Subscribed to temperature notifications
+Temperature: 21.96°C
+LED set to ON
+2.4 Client Mode (Central)
+Build flag: -DBLE_TEST_CLIENT (note: uppercase CLIENT, not ClIENT)
+
+Second ESP32‑S3 flashed as client, first ESP32‑D as server.
+
+Client successfully:
+
+Scanned and found server
+
+Connected
+
+Discovered 1 service / 3 characteristics
+
+Subscribed to temperature notifications
+
+Server side showed:
+
+text
+Connection established
+Client subscribed to attr=16
+Connections: 1
+Notifications flowed every 5 seconds from server to client.
+
+Minor issue: Read/write timeouts on client (timeout after 5 s) – subscription still worked, notifications OK.
+
+Summary of Working Features
+Stack	Tested Modes	Result
+LoRa SX1262	TX beacon, RX gateway	✅ Packets received
+BLE NimBLE	Scanner, Server, Client, Web Bluetooth	✅ All functional
+Inter‑device	BLE client ↔ server (ESP32‑D ↔ ESP32‑S3)	✅ Connection & notify
+Key Lessons
+SX1262 bandwidth values are not the same as SX1276 – always check the datasheet.
+
+TX_DONE does not guarantee RF was emitted – invalid parameters can still complete the TX state machine.
+
+On ESP32‑S3, GPIO 43/44 are UART0 by default – use gpio_reset_pin() to use them as GPIO.
+
+BLE GATT services must be built after NimBLE host initialises – order matters.
+
+Web Bluetooth requires services to be either advertised or explicitly requested – using optionalServices or scanning all services works.
+
+Two ESP32s can talk BLE – central ↔ peripheral works with NimBLE.
+
+Next Steps (Optional)
+Fix client‑side read/write timeouts (increase timeout or retry logic).
+
+Test LoRa between two ESP32‑S3 boards.
+
+Move on to Zigbee (ESP32‑C6 boards) or ESP‑Mesh.
 
 
 

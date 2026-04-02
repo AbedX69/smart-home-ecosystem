@@ -137,6 +137,8 @@ static void onPingPong(const LoRaRxPacket* pkt) {
  * ========================================================================== */
 
 extern "C" void app_main(void) {
+    vTaskDelay(pdMS_TO_TICKS(3000));  // 3 second delay to catch boot output
+
     ESP_LOGI(TAG, "╔══════════════════════════════════════════╗");
 #if defined(LORA_TEST_TX)
     ESP_LOGI(TAG, "║     LoRa Test - SENSOR BEACON TX          ║");
@@ -153,12 +155,11 @@ extern "C" void app_main(void) {
     LoRaConfig config;
     config.frequency = 915000000;       // 915 MHz (US ISM band)
     config.spreading_factor = 7;        // Fast, ~2km range
-    config.bandwidth = 7;               // 125 kHz (index 7)
+    config.bandwidth = 4;               // 125 kHz 
     config.coding_rate = 1;             // 4/5
     config.tx_power = 22;              // Max power
     config.crc_on = true;
     config.sync_word = 0x12;           // Private network
-
     esp_err_t ret = lora.begin(LoRaPinPresets::XIAO_S3_WIO_B2B, config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "LoRa init failed: %s", esp_err_to_name(ret));
@@ -173,33 +174,31 @@ extern "C" void app_main(void) {
     });
 
     uint8_t node_id = 0x01;
+while (true) {
+    int16_t temp_x10 = 235 + (seq_num % 20);
+    uint16_t hum_x10 = 580 + (seq_num % 30);
 
-    while (true) {
-        /* Build sensor packet with simulated data */
-        int16_t temp_x10 = 235 + (seq_num % 20);   // 23.5 - 25.4 °C
-        uint16_t hum_x10 = 580 + (seq_num % 30);   // 58.0 - 60.9 %
+    uint8_t packet[8];
+    packet[0] = PKT_TYPE_SENSOR;
+    packet[1] = node_id;
+    packet[2] = (seq_num >> 8) & 0xFF;
+    packet[3] = seq_num & 0xFF;
+    packet[4] = (temp_x10 >> 8) & 0xFF;
+    packet[5] = temp_x10 & 0xFF;
+    packet[6] = (hum_x10 >> 8) & 0xFF;
+    packet[7] = hum_x10 & 0xFF;
 
-        uint8_t packet[8];
-        packet[0] = PKT_TYPE_SENSOR;
-        packet[1] = node_id;
-        packet[2] = (seq_num >> 8) & 0xFF;
-        packet[3] = seq_num & 0xFF;
-        packet[4] = (temp_x10 >> 8) & 0xFF;
-        packet[5] = temp_x10 & 0xFF;
-        packet[6] = (hum_x10 >> 8) & 0xFF;
-        packet[7] = hum_x10 & 0xFF;
+    ESP_LOGI(TAG, "TX beacon #%d: temp=%.1f°C hum=%.1f%%",
+             seq_num, temp_x10 / 10.0f, hum_x10 / 10.0f);
 
-        ESP_LOGI(TAG, "TX beacon #%d: temp=%.1f°C hum=%.1f%%",
-                 seq_num, temp_x10 / 10.0f, hum_x10 / 10.0f);
-
-        ret = lora.send(packet, sizeof(packet));
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Send failed: %s", esp_err_to_name(ret));
-        }
-
-        seq_num++;
-        vTaskDelay(pdMS_TO_TICKS(5000));
+    esp_err_t ret = lora.send(packet, sizeof(packet));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Send failed: %s", esp_err_to_name(ret));
     }
+
+    seq_num++;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+}
 
     /* ── GATEWAY RX MODE ───────────────────────────────────────────── */
 #elif defined(LORA_TEST_RX)
@@ -212,11 +211,10 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "  SF7 / BW125 / CR4/5");
     ESP_LOGI(TAG, "");
 
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-        ESP_LOGI(TAG, "Gateway alive. Packets received: %lu", (unsigned long)rx_count);
-    }
-
+  while (true) {
+  
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
     /* ── PING-PONG MODE ────────────────────────────────────────────── */
 #else
 

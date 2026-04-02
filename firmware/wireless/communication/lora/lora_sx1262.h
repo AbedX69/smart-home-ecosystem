@@ -199,19 +199,23 @@ struct LoRaPins {
     int reset;      ///< NRESET
     int busy;       ///< BUSY pin
     int dio1;       ///< DIO1 (interrupt)
+    int txen;       ///< TX enable (-1 if not used)
+    int rxen;       ///< RX enable (-1 if not used)
 };
 
 /* Predefined pin configs for known boards */
-namespace LoRaPinPresets {
+    namespace LoRaPinPresets {
     /* XIAO ESP32-S3 + Wio-SX1262 (B2B connector / kit version) */
     static constexpr LoRaPins XIAO_S3_WIO_B2B = {
         .sck   = 7,
         .mosi  = 9,
         .miso  = 8,
         .nss   = 41,
-        .reset = 3,
-        .busy  = 4,
-        .dio1  = 2
+        .reset = 42,   // was 3
+        .busy  = 40,   // was 4
+        .dio1 = 39,    // was 2
+        .txen = 43, 
+        .rxen = 44  
     };
 
     /* XIAO ESP32-S3 + Wio-SX1262 (edge pin / non-kit version) */
@@ -222,13 +226,15 @@ namespace LoRaPinPresets {
         .nss   = 4,     // D2
         .reset = 3,     // D1
         .busy  = 2,     // D0
-        .dio1  = 1      // D0 area
+        .dio1  = 1,      // D0 area
+        .txen = -1,
+        .rxen = -1
     };
 
     /* Generic: user must fill in pins */
     static constexpr LoRaPins CUSTOM = {
         .sck = -1, .mosi = -1, .miso = -1,
-        .nss = -1, .reset = -1, .busy = -1, .dio1 = -1
+        .nss = -1, .reset = -1, .busy = -1, .dio1 = -1, .txen = -1, .rxen = -1
     };
 }
 
@@ -237,8 +243,8 @@ namespace LoRaPinPresets {
 struct LoRaConfig {
     uint32_t    frequency       = 915000000;    ///< Hz (868000000 for EU, 915000000 for US)
     uint8_t     spreading_factor = 7;           ///< 7-12
-    uint8_t     bandwidth       = 4;            ///< 0=7.8k 1=10.4k 2=15.6k 3=20.8k 4=31.25k
-                                                ///< 5=41.7k 6=62.5k 7=125k 8=250k 9=500k
+       uint8_t     bandwidth       = 4;            ///< 0=7.81k 1=15.63k 2=31.25k 3=62.5k 4=125k 5=250k 6=500k
+
     uint8_t     coding_rate     = 1;            ///< 1=4/5 2=4/6 3=4/7 4=4/8
     int8_t      tx_power        = 22;           ///< dBm (-9 to +22)
     uint16_t    preamble_length = 8;
@@ -246,7 +252,7 @@ struct LoRaConfig {
     bool        implicit_header = false;        ///< false = explicit (includes length)
     uint8_t     sync_word       = 0x12;         ///< 0x12=private, 0x34=public (LoRaWAN)
     bool        use_dcdc        = true;         ///< DC-DC converter (lower power)
-    bool        use_dio2_rf_sw  = true;         ///< DIO2 controls RF switch (common on modules)
+    bool        use_dio2_rf_sw  = false;         ///< DIO2 controls RF switch (common on modules)
 };
 
 /* ─── RX Packet Info ─────────────────────────────────────────────────────── */
@@ -365,6 +371,9 @@ public:
     void setRxCallback(LoRaRxCb cb);
     void setTxDoneCallback(LoRaTxDoneCb cb);
 
+    uint16_t getIrqStatus();
+
+
 private:
     LoRaSX1262();
     ~LoRaSX1262();
@@ -392,7 +401,6 @@ private:
     void setBufferBaseAddress(uint8_t tx_base, uint8_t rx_base);
     void setDioIrqParams(uint16_t irq_mask, uint16_t dio1_mask,
                           uint16_t dio2_mask, uint16_t dio3_mask);
-    uint16_t getIrqStatus();
     void clearIrqStatus(uint16_t mask);
     void setRegulatorMode(uint8_t mode);    // 0=LDO, 1=DC-DC
     void setDio2AsRfSwitch(bool enable);
@@ -400,6 +408,7 @@ private:
     void setSyncWord(uint8_t sync);
     void fixInvertedIQ();
 
+    void setDio3AsTcxoCtrl(float voltage, uint32_t timeout_ms);
     /* ─── DIO1 Interrupt ───────────────────────────────────────────────── */
     static void IRAM_ATTR dio1ISR(void* arg);
     static void irqTaskFunc(void* arg);
