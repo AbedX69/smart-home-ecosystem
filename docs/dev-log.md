@@ -1217,9 +1217,7 @@ Web Bluetooth requires services to be either advertised or explicitly requested 
 Two ESP32s can talk BLE – central ↔ peripheral works with NimBLE.
 
 Next Steps (Optional)
-Fix client‑side read/write timeouts (increase timeout or retry logic).
 
-Test LoRa between two ESP32‑S3 boards.
 
 Move on to Zigbee (ESP32‑C6 boards) or ESP‑Mesh.
 
@@ -1243,6 +1241,88 @@ Move on to Zigbee (ESP32‑C6 boards) or ESP‑Mesh.
 
 
 
+Dev Log — 11/04/2026 (Sat)
+Project: Dual LED Controller (ESP32-S3)
+Hardware:
+
+2× TTP223 touch sensors (GPIO 4, 5)
+2× rotary encoders (CLK/DT/SW: 6/7/15, 16/17/18)
+2× SSD1306 OLED via PCA9548A I2C mux (SDA=8, SCL=9)
+2× GC9A01 round TFT on shared SPI (MOSI=11, SCK=12)
+
+GC9A01 #1: CS=38, DC=39, RST=40, BLK=3
+GC9A01 #2: CS=21, DC=47, RST=48
+
+
+
+
+Build Errors Fixed (in order)
+#ErrorFix1esp_log unknown componentRemoved from ssd1306 CMakeLists.txt REQUIRES2Format truncation -Werrorchar name[8] → char name[16]3epaper.cpp missing fontNarrowed EXTRA_COMPONENT_DIRS to exclude epaper4gc9a01 font not foundAdded "../shared" to gc9a01/CMakeLists.txt INCLUDE_DIRS5font5x7 not declaredRenamed to FONT_5X7 (matches shared header)
+
+Runtime Errors Fixed
+#ErrorRoot CauseFix6i2c: CONFLICT! driver_ng not allowedSSD1306 had both legacy and new I2C APIRewrote SSD1306 to use only new API7Stack overflow in task mainLarge objects on stack (2× 1KB OLED buffers + TFT objects)Added sdkconfig.defaults with CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+Display Performance Improvements
+Problem: GC9A01 arc drawing was painfully slow
+
+Full screen clear on every update
+Arc redrew from 0° every time
+Blocked encoder input during redraw
+
+Solution: Incremental rendering
+ChangeBeforeAfterArc method360 radial lines (drawLine)Horizontal scanlines (drawHLine)Full redrawEvery updateOnly on toggle on/offBrightness changeRedraw entire arcDraw/erase only the deltaColor changeFull screen clearOverdraw arc in new colorArc shapeSolid pie sliceDonut (inner radius protects text)Fill directionBottom → topCenter → outward
+Bugs Fixed During Optimization
+BugCauseFix4th quarter fills entire scanlineNon-contiguous arc pixels on same rowTrack contiguous runs, draw each separatelyLeftover digits (113% shown as "3%")New text shorter than oldfillRect() to clear text area before redrawClear rect clips outside inner circleRect too large (72×24)Shrunk to 48×16
+
+Hardware/Pin Changes
+Changed GC9A01 #1 pins:
+Before: CS=10, DC=13, RST=14
+After:  CS=38, DC=39, RST=40
+
+Shared SPI Bus Fix
+Problem
+GC9A01 #1 worked, #2 didn't display anything (backlight on, no image).
+Investigation
+
+Swapped displays → same display works on #2 position
+Rewired 3× with known-good wires → still nothing
+Not hardware
+
+Root Cause
+Both displays shared MOSI=11, SCK=12, but used different SPI hosts (SPI2_HOST vs SPI3_HOST). Can't share pins across hosts.
+Fix
+
+Changed both to SPI2_HOST
+Modified gc9a01.cpp init():
+
+cppesp_err_t err = spi_bus_initialize(spiHost, &busConfig, SPI_DMA_CH_AUTO);
+if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  // Allow "already init"
+    return false;
+}
+
+Modified destructor to NOT call spi_bus_free() (bus is shared)
+
+
+Final State
+Both displays working:
+
+Touch toggles LED on/off
+Encoder rotation adjusts brightness (mode B) or hue (mode C)
+Encoder button switches mode
+SSD1306 shows text status
+GC9A01 shows donut arc with smooth incremental updates
+
+
+Files Modified
+FileChangesmain/main.cppPin defines, incremental arc rendering, donut shapecomponents/display/gc9a01/gc9a01.cppShared SPI bus handlingcomponents/display/ssd1306/ssd1306.cppNew I2C API onlysdkconfig.defaultsStack size 16KBplatformio.iniPin definitions in build_flags
+
+Key Takeaways
+
+Same SPI host for shared bus — can't use different hosts with same MOSI/SCK
+ESP_ERR_INVALID_STATE is OK — means bus already initialized, just add device
+Horizontal scanlines >> radial lines — fewer SPI transactions, much faster
+Track contiguous runs — don't assume arc pixels are contiguous on a scanline
+Clear before redraw — text artifacts happen when new string is shorter
 
 
 

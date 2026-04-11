@@ -10,8 +10,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include "../shared/font_5x7.h"
-
+#include "font_5x7.h"
 
 static const char* TAG = "GC9A01";
 
@@ -73,7 +72,7 @@ GC9A01::GC9A01(gpio_num_t mosiPin, gpio_num_t sckPin, gpio_num_t csPin,
 GC9A01::~GC9A01() {
     if (initialized && spiDevice) {
         spi_bus_remove_device(spiDevice);
-        spi_bus_free(spiHost);
+        // Don't free bus - might be shared with other displays
     }
 }
 
@@ -127,10 +126,11 @@ bool GC9A01::init() {
     busConfig.max_transfer_sz = 240 * 240 * 2 + 8;  // Full screen + overhead
 
     esp_err_t err = spi_bus_initialize(spiHost, &busConfig, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
         return false;
     }
+    // ESP_ERR_INVALID_STATE means bus already initialized - that's OK for shared bus
 
     /*
      * -------------------------------------------------------------------------
@@ -706,7 +706,7 @@ void GC9A01::fillCircle(int16_t cx, int16_t cy, int16_t radius, uint16_t color) 
 uint8_t GC9A01::drawChar(int16_t x, int16_t y, char c, uint16_t color, uint16_t bg, uint8_t size) {
     if (c < 32 || c > 126) c = '?';
     
-    const uint8_t* charData = &font5x7[(c - 32) * 5];
+    const uint8_t* charData = &FONT_5X7[(c - 32) * 5];
     
     for (uint8_t col = 0; col < 5; col++) {
         uint8_t colData = charData[col];
