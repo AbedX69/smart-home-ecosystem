@@ -273,7 +273,7 @@
 /**
  * @brief Default PWM configuration
  */
-#define MOSFET_DEFAULT_FREQ     5000                // 5kHz (no audible whine)
+#define MOSFET_DEFAULT_FREQ     21000                // 21kHz (no audible whine)
 #define MOSFET_DEFAULT_RES      LEDC_TIMER_10_BIT   // 0-1023 steps
 
 

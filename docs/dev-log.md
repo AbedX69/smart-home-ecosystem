@@ -1353,7 +1353,199 @@ Clear before redraw — text artifacts happen when new string is shorter
 
 
 
+# Dev Log — ESP-MESH Testing
 
+**Date:** 2026-04-24  
+**Component:** ESP-MESH Manager (`esp_mesh_manager`)  
+**Hardware:** ESP32D (root), XIAO ESP32-C6 (node), ESP32-C6 DevKitC (node)  
+**Framework:** ESP-IDF 5.5.0 via PlatformIO  
+
+---
+
+## Goal
+
+Test the ESP-MESH manager component with 3 boards:
+- ESP32D as **root** (connects to home WiFi, starts mesh)
+- Two C6 boards as **nodes** (join mesh, send messages to root)
+
+Verify: node auto-join, root↔node messaging, broadcast, disconnect/reconnect, and multi-hop routing.
+
+---
+
+## Build Issues & Fixes
+
+### 1. PlatformIO can't find `src` folder
+- **Problem:** PlatformIO expects `src/` but test uses `main/`
+- **Fix:** Added `src_dir = main` under `[platformio]` in `platformio.ini`
+
+### 2. CMake can't resolve component names
+- **Problem:** `esp_mesh_manager` and `wifi_manager` not found — CMake resolves components by **directory name**, not by class/file name
+- **Fix:** Changed `main/CMakeLists.txt` requires from `esp_mesh_manager` → `mesh`, `wifi_manager` → `wifi`
+
+### 3. `lib_extra_dirs` pulls in everything (including Zigbee)
+- **Problem:** `lib_extra_dirs = ../../communication` drags in all subfolders including `zigbee`, which needs the Zigbee SDK not available for ESP32 classic
+- **Fix:** Replaced `lib_extra_dirs` with explicit `EXTRA_COMPONENT_DIRS` in root `CMakeLists.txt`:
+```cmake
+set(EXTRA_COMPONENT_DIRS
+    "../../communication/mesh"
+    "../../communication/wifi"
+    "../../communication/esp_now"
+)
+```
+
+### 4. Mesh component references `wifi_manager` internally
+- **Problem:** `mesh/CMakeLists.txt` had `PRIV_REQUIRES wifi_manager esp_now_manager` but folder names are `wifi` and `esp_now`
+- **Fix:** Changed to `PRIV_REQUIRES wifi esp_now`
+
+### 5. `WiFiManager::begin()` doesn't exist
+- **Problem:** `WiFiManager` has `beginSTA()`, `beginAP()`, etc. — no plain `begin()`
+- **Fix:** Replaced WiFiManager usage with direct ESP-IDF WiFi init:
+```cpp
+ESP_ERROR_CHECK(esp_netif_init());
+ESP_ERROR_CHECK(esp_event_loop_create_default());
+ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(nullptr, nullptr));
+wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+ESP_ERROR_CHECK(esp_wifi_start());
+```
+
+### 6. ESP-IDF 5.5 API changes
+| Old (pre-5.5) | New (5.5) |
+|---|---|
+| `esp_mesh_get_routing_table_size(&count)` | `count = esp_mesh_get_routing_table_size()` (returns int, no args) |
+| `MESH_EVENT_ROOT_GOT_IP` | Removed — handled by regular IP event handler |
+| `MESH_EVENT_ROOT_LOST_IP` | Removed |
+| `memset(&_config, 0, sizeof(_config))` | `_config = MeshConfig{}` (C6 toolchain treats memset on non-trivial types as error) |
+
+### 7. RX task exits immediately
+- **Problem:** `esp_mesh_recv()` called before mesh connects, gets `ESP_ERR_MESH_NOT_START`, task exits forever
+- **Fix:** Added wait loop at top of `rxTaskFunc`:
+```cpp
+while (!self->_connected) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+}
+```
+
+### 8. Root finds router but never connects (scan loop)
+- **Problem:** Mesh didn't know the node was supposed to be root
+- **Fix:** Added `esp_mesh_set_type(MESH_ROOT)` before `esp_mesh_fix_root(true)`:
+```cpp
+if (config.is_root) {
+    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
+    ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+}
+```
+
+### 9. C6 node crashes — `ESP_ERR_MESH_ARGUMENT` on `esp_mesh_set_config`
+- **Problem:** ESP-IDF 5.5 rejects `mesh_cfg_t` with empty router fields (ssid_len:0)
+- **Fix:** ALL nodes (not just root) must set router SSID/password in `mesh_cfg.router`. Non-root nodes use this info to identify which mesh network to join:
+```cpp
+if (strlen(config.router_ssid) > 0) {
+    memcpy(mesh_cfg.router.ssid, config.router_ssid, strlen(config.router_ssid));
+    mesh_cfg.router.ssid_len = strlen(config.router_ssid);
+    memcpy(mesh_cfg.router.password, config.router_pass, strlen(config.router_pass));
+}
+ESP_ERROR_CHECK(esp_mesh_set_config(&mesh_cfg));
+```
+
+### 10. C6 binary too large (1078KB > 1048KB limit)
+- **Problem:** Default partition table only allocates 1MB for app
+- **Fix:** Created `partitions_large.csv` with 3.9MB app partition:
+```csv
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x3F0000,
+```
+
+---
+
+## Test Results
+
+### Root (ESP32D) — ROOT MODE
+- Connected to home WiFi router (AbedX69) on channel 8, RSSI: -46 dBm
+- Started mesh, accepted children
+- Received messages from both nodes
+- Broadcasts succeeded once children connected
+- Broadcasts correctly fail with `ESP_ERR_MESH_DISCARD` when no children present
+
+### Node 1 (XIAO ESP32-C6) — NODE MODE
+- Auto-joined mesh at **layer 2** (direct child of root)
+- Sent `NODE MSG #0..N` to root successfully
+- `TX fail: 0` — no dropped messages
+- MAC: `B4:3A:45:8A:81:74`
+
+### Node 2 (ESP32-C6 DevKit) — NODE MODE
+- Auto-joined mesh at **layer 2** (direct child of root)
+- Sent `NODE MSG #0..N` to root successfully
+- Disconnected/reconnected cleanly when moved out of range
+- MAC: `58:8C:81:36:B7:5C`
+
+### 3-Node Mesh Status (stable)
+```
+Connected : YES
+Is root   : YES
+Layer     : 1
+Children  : 2
+Total nodes: 3
+TX fail   : 0 (after children joined)
+```
+
+### Multi-Hop Test
+- Attempted to separate boards to force layer 3 routing
+- Both C6 nodes remained at layer 2 — apartment too small for WiFi to drop off between boards
+- When moved too far, nodes disconnected entirely rather than reparenting through middle node
+- Multi-hop routing confirmed to work in ESP-MESH architecture, but requires larger physical space or reduced TX power (`esp_wifi_set_max_tx_power()`) to test
+
+---
+
+## What Was Verified
+
+| Feature | Status |
+|---|---|
+| Root connects to home router | ✅ |
+| Node auto-joins mesh | ✅ |
+| Node → Root messaging | ✅ |
+| Root → All broadcast | ✅ |
+| 3-node mesh (root + 2 nodes) | ✅ |
+| Node disconnect detection | ✅ |
+| Node auto-reconnect | ✅ |
+| ESP32D + ESP32-C6 interop | ✅ |
+| Multi-hop (layer 3) routing | ⚠️ Not tested — space too small |
+
+---
+
+## Key Takeaways
+
+1. **ESP-IDF 5.5 changed mesh APIs** — `esp_mesh_get_routing_table_size()` signature changed, `MESH_EVENT_ROOT_GOT_IP` removed, stricter config validation
+2. **ALL nodes need router SSID** — not just root. Nodes use it to identify the correct mesh network
+3. **`esp_mesh_set_type(MESH_ROOT)` is required** — `esp_mesh_fix_root(true)` alone isn't enough for the root to actually connect to the router
+4. **C6 toolchain is stricter** — `memset` on non-trivial types is an error, unused variables are errors
+5. **Component names = directory names** — CMake resolves by folder name, not by class or header name
+6. **Don't use `lib_extra_dirs` for selective components** — it pulls everything. Use `EXTRA_COMPONENT_DIRS` in CMakeLists.txt instead
+7. **Mesh netifs must be created before `esp_wifi_init()`** — order matters
+
+---
+
+## Files Modified
+
+| File | Change |
+|---|---|
+| `mesh-test/platformio.ini` | Added `src_dir`, board configs, partition table, router credentials for all envs |
+| `mesh-test/CMakeLists.txt` | Explicit `EXTRA_COMPONENT_DIRS` instead of `lib_extra_dirs` |
+| `mesh-test/main/CMakeLists.txt` | Corrected component requires |
+| `mesh-test/main/main.cpp` | Direct WiFi init, mesh netifs, router creds for NODE/LEAF modes |
+| `mesh-test/partitions_large.csv` | Created — 3.9MB app partition for C6 |
+| `communication/mesh/CMakeLists.txt` | Fixed `PRIV_REQUIRES` to use folder names |
+| `communication/mesh/esp_mesh_manager.cpp` | ESP-IDF 5.5 API fixes, RX task wait, router config for all nodes, `MESH_ROOT` type |
+
+---
+
+## Next
+
+- [ ] LoRa ping-pong test (2x XIAO S3 + Wio-SX1262)
+- [ ] Integrate mesh into main firmware architecture
 
 
 
