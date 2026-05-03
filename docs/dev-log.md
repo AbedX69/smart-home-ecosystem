@@ -1575,7 +1575,158 @@ TX fail   : 0 (after children joined)
 
 
 
+# Dev Log — LoRa Ping-Pong Range Test
 
+**Date:** 2026-05-03  
+**Component:** LoRa SX1262 Ping-Pong (`lora-test`, `-DLORA_TEST_PINGPONG`)  
+**Hardware:** 2× XIAO ESP32-S3 + Wio-SX1262 B2B kits  
+**Framework:** ESP-IDF 5.5.0 via PlatformIO  
+
+---
+
+## Goal
+
+Test bidirectional LoRa communication (ping-pong) between two boards, then do an outdoor range test.
+
+- COM6 as **ping sender** (`node_id = 0x01`) — sends PING every 5s, waits for PONG
+- COM9 as **pong responder** (`node_id = 0x02`) — listens continuously, replies with PONG
+
+Verify: round-trip time, RSSI/SNR at distance, packet loss, max range.
+
+---
+
+## Bugs & Fixes
+
+### 1. Responder never receives PINGs
+
+- **Problem:** COM9 (responder) initialized fine, entered continuous RX, but never received any packets from COM6 (sender)
+- **Investigation:**
+  - Flashed COM6 as `LORA_TEST_TX` and COM9 as `LORA_TEST_RX` — packets received fine (RSSI -68 dBm, SNR 13 dB)
+  - Confirmed radio link works, bug is specific to ping-pong code path
+- **Root cause:** Stale cached build objects. The ping-pong firmware was compiled against an older version of the driver
+- **Fix:** `pio run -e s3_seeed -t clean` then reflash both boards sequentially
+- **Result:** 100% packet reception after clean build
+
+### 2. Deadlock in responder callback
+
+- **Problem:** `onPingPong` callback called `lora.send()` directly. `send()` blocks waiting for `_tx_done_sem`, but that semaphore is given inside `handleIrq()` — the same function that invoked the callback. IRQ task deadlocks waiting on itself.
+- **Fix:** Moved `send()` out of callback into the main loop using a flag:
+
+```cpp
+// Callback just sets flag + copies data
+static volatile bool send_pong = false;
+static uint8_t pong_data[4];
+
+static void onPingPong(const LoRaRxPacket* pkt) {
+    if (pkt->data[0] == PKT_TYPE_PING) {
+        pong_data[0] = PKT_TYPE_PONG;
+        pong_data[1] = 0x02;
+        pong_data[2] = pkt->data[2];
+        pong_data[3] = pkt->data[3];
+        send_pong = true;
+    }
+}
+
+// Main loop does the actual send
+while (true) {
+    if (send_pong) {
+        send_pong = false;
+        lora.stopReceive();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        lora.send(pong_data, 4);
+        lora.startReceive();
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+```
+
+### 3. TX timeout after moving board to power bank
+
+- **Problem:** After disconnecting COM6 from laptop and plugging into power bank, `send()` returned `ESP_ERR_TIMEOUT` on every attempt. Persisted after reset.
+- **Root cause:** B2B connector came loose when physically moving the board. The Wio-SX1262 module wasn't seated properly on the XIAO.
+- **Fix:** Reseated the module firmly. TX resumed immediately.
+
+### 4. Responder recovery after disconnect
+
+- **Problem:** After the responder (node 0x02) goes offline and comes back, the sender (node 0x01) doesn't recover — keeps timing out even though responder is alive again
+- **Status:** Observed but not root-caused yet. Sender was still printing "Sending PING" with timeouts, so the loop was alive but the radio may have been stuck. Workaround: reset the sender.
+
+---
+
+## Test Results
+
+### Close Range (same desk, ~1m)
+
+| Setting | RTT | RSSI | SNR | Packet Loss |
+|---------|-----|------|-----|-------------|
+| SF7 / BW125 | ~136 ms | -76 to -82 dBm | 12-13 dB | 0% |
+| SF12 / BW125 | ~1790 ms | -65 to -71 dBm | 5-7 dB | 0% |
+
+### Indoor Range (across house, multiple walls)
+
+| Setting | RSSI | SNR | Packet Loss |
+|---------|------|-----|-------------|
+| SF12 / BW125 | -95 to -114 dBm | -11 to 11 dB | 0% |
+
+Worst successful packet: **RSSI -114 dBm, SNR -11 dB** — still decoded correctly at SF12.
+
+### Outdoor Range (urban Tel Aviv, in car)
+
+| Setting | Distance | RSSI | SNR | Result |
+|---------|----------|------|-----|--------|
+| SF7 / BW125 | Same block | -95 to -109 dBm | 3-10 dB | Working, occasional drops |
+| SF7 / BW125 | Next block (~150m) | — | — | Total loss |
+
+Last successful SF7 packet before loss: **RSSI -109 dBm, SNR 3 dB**
+
+### Antenna Observations
+
+- **-70 dBm at 1 meter** with PCB antenna — abnormally weak for 22 dBm TX power
+- **Car body added ~15 dB attenuation** (from -75 to -90 dBm just sitting in car)
+- PCB antenna is the primary bottleneck, not the radio settings
+- Ordered: 4× U.FL 915MHz 3dBi whip antennas + pigtails (₪23 total)
+
+---
+
+## Configuration Changes for SF12
+
+```cpp
+config.spreading_factor = 12;    // Was 7
+
+// Increased timeouts for longer air time
+lora.receiveOnce(10000);         // Was 3000
+
+// Wait loop
+while (waiting_pong &&
+       (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(10000)) {  // Was 3000
+```
+
+---
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `main/main.cpp` | Deadlock fix (send from main loop, not callback), added `send_pong` flag + `pong_data` globals, SF12 config, increased timeouts |
+
+---
+
+## Key Takeaways
+
+1. **Never call blocking driver functions from IRQ callbacks** — `send()` waits on a semaphore given by the same IRQ handler. Use a flag and handle it in the main loop.
+2. **Clean builds matter** — stale cached objects caused phantom failures that looked like driver bugs. When in doubt, `pio run -t clean`.
+3. **B2B connectors are fragile** — physically moving the board can unseat the module. Always check connection after moving.
+4. **PCB antennas are the bottleneck** — 22 dBm TX power means nothing when the antenna eats 60 dB. External whip antennas should recover 20-30 dB.
+5. **SF12 buys ~20 dB link budget over SF7** — but costs 50× air time (1.8s RTT vs 136ms). Worth it for sensors that transmit infrequently.
+6. **TX_DONE fires even without valid RF** — the sender shows no errors when the responder is gone. Application-level ACK (like ping-pong) is the only way to know if the other side is alive.
+
+---
+
+## Next Steps
+
+- [ ] Retest range with external whip antennas (when delivered)
+- [ ] Investigate sender recovery issue after responder reconnect
+- [ ] Integrate LoRa into main firmware architecture
 
 
 

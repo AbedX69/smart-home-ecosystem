@@ -98,6 +98,8 @@ static void onPacketReceived(const LoRaRxPacket* pkt) {
 
 static bool waiting_pong = false;
 static uint32_t ping_sent_time = 0;
+static volatile bool send_pong = false;
+static uint8_t pong_data[4];
 
 static void onPingPong(const LoRaRxPacket* pkt) {
     if (pkt->length < 4) return;
@@ -106,21 +108,13 @@ static void onPingPong(const LoRaRxPacket* pkt) {
     uint16_t seq = ((uint16_t)pkt->data[2] << 8) | pkt->data[3];
 
     if (type == PKT_TYPE_PING) {
-        ESP_LOGI(TAG, "Got PING #%d (RSSI=%d, SNR=%d) → sending PONG",
+        ESP_LOGI(TAG, "Got PING #%d (RSSI=%d, SNR=%d)",
                  seq, pkt->rssi, pkt->snr);
-
-        /* Send pong back */
-        uint8_t pong[4];
-        pong[0] = PKT_TYPE_PONG;
-        pong[1] = 0x02;  // Node 2
-        pong[2] = pkt->data[2];
-        pong[3] = pkt->data[3];
-
-        vTaskDelay(pdMS_TO_TICKS(100));  // Small delay before TX
-        LoRaSX1262::instance().send(pong, 4);
-
-        /* Re-enter RX */
-        LoRaSX1262::instance().startReceive();
+        pong_data[0] = PKT_TYPE_PONG;
+        pong_data[1] = 0x02;
+        pong_data[2] = pkt->data[2];
+        pong_data[3] = pkt->data[3];
+        send_pong = true;
     }
     else if (type == PKT_TYPE_PONG && waiting_pong) {
         uint32_t rtt = (uint32_t)(esp_timer_get_time() / 1000) - ping_sent_time;
@@ -154,7 +148,7 @@ extern "C" void app_main(void) {
 
     LoRaConfig config;
     config.frequency = 915000000;       // 915 MHz (US ISM band)
-    config.spreading_factor = 7;        // Fast, ~2km range
+    config.spreading_factor = 12;        // Fast, ~2km range
     config.bandwidth = 4;               // 125 kHz 
     config.coding_rate = 1;             // 4/5
     config.tx_power = 22;              // Max power
@@ -216,19 +210,13 @@ while (true) {
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     /* ── PING-PONG MODE ────────────────────────────────────────────── */
+/* ── PING-PONG MODE ────────────────────────────────────────────── */
 #else
 
     lora.setRxCallback(onPingPong);
 
-    /*
-     * This device acts as the PING sender.
-     * Flash the other device with LORA_TEST_PINGPONG too —
-     * it will respond to PINGs with PONGs automatically.
-     *
-     * To make one device the "responder only", just set:
-     *   node_id = 0x02 and skip the ping-sending loop.
-     */
-    uint8_t node_id = 0x01;  // Change to 0x02 for responder
+    uint8_t node_id = 0x01;  // Change to 0x01 for ping sender
+
 
     if (node_id == 0x01) {
         /* Ping sender */
@@ -245,13 +233,11 @@ while (true) {
 
             ret = lora.send(ping, 4);
             if (ret == ESP_OK) {
-                /* Enter RX to wait for pong */
-                lora.receiveOnce(3000);
+                lora.receiveOnce(10000);
 
-                /* Wait for pong or timeout */
                 uint32_t wait_start = xTaskGetTickCount();
                 while (waiting_pong &&
-                       (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(3000)) {
+                       (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(10000)) {
                     vTaskDelay(pdMS_TO_TICKS(50));
                 }
 
@@ -265,12 +251,19 @@ while (true) {
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     } else {
-        /* Pong responder: just listen */
+        /* Pong responder: send from main loop, not from callback */
         lora.startReceive();
         ESP_LOGI(TAG, "Responder mode — waiting for PINGs...");
 
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(10000));
+            if (send_pong) {
+                send_pong = false;
+                lora.stopReceive();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                lora.send(pong_data, 4);
+                lora.startReceive();
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
