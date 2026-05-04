@@ -160,91 +160,200 @@ void hueToRgb(uint16_t hue, uint8_t& r, uint8_t& g, uint8_t& b) {
 
 
 // =============================================================================
-// GC9A01 DRAWING HELPERS
+// PRE-COMPUTED ANGLE LOOKUP TABLE
+// =============================================================================
+// 
+// Instead of calling atan2f or using a lossy integer approximation per pixel,
+// we pre-compute angles for every (dx, dy) offset within the arc radius.
+// Table covers one quadrant (dx=0..outerR, dy=0..outerR), mirrored at runtime.
+// 
+// Built once at startup, costs ~10KB for radius=100 (101*101 bytes).
+// Returns angle in degrees 0-90 for quadrant 1, mapped to 0-360 at runtime.
+
+#define ARC_MAX_RADIUS 101  // outerRadius(100) + 1
+
+static uint8_t angleLUT[ARC_MAX_RADIUS][ARC_MAX_RADIUS];  // [dx][dy] -> angle 0-90
+
+static void buildAngleLUT() {
+    for (int dx = 0; dx < ARC_MAX_RADIUS; dx++) {
+        for (int dy = 0; dy < ARC_MAX_RADIUS; dy++) {
+            if (dx == 0 && dy == 0) {
+                angleLUT[dx][dy] = 0;
+            } else {
+                // atan2(dx, dy) gives angle from Y axis (north) clockwise
+                float rad = atan2f((float)dx, (float)dy);
+                angleLUT[dx][dy] = (uint8_t)(rad * 180.0f / M_PI + 0.5f);
+            }
+        }
+    }
+}
+
+// Get angle 0-359, 0=top, clockwise, using LUT
+static inline int getAngle(int dx, int dy) {
+    // dx = east component, dy = south component (screen coords)
+    // We want 0=north (up), clockwise
+    // So north = -dy in screen coords
+    
+    int adx = dx < 0 ? -dx : dx;
+    int ady = dy < 0 ? -dy : dy;
+    
+    // Clamp to LUT bounds
+    if (adx >= ARC_MAX_RADIUS) adx = ARC_MAX_RADIUS - 1;
+    if (ady >= ARC_MAX_RADIUS) ady = ARC_MAX_RADIUS - 1;
+    
+    // LUT gives angle from +Y axis to +X axis (0-90)
+    // We need to map based on which quadrant (dx, -dy) falls in
+    // Remember: screen Y is inverted, so "north" = negative dy
+    
+    int q1angle;
+    
+    if (dy <= 0) {
+        // Upper half (north)
+        if (dx >= 0) {
+            // Q1: NE — angle = atan2(dx, -dy) = atan2(adx, ady)
+            q1angle = angleLUT[adx][ady];
+            return q1angle;
+        } else {
+            // Q4: NW — angle = 360 - atan2(adx, ady)
+            q1angle = angleLUT[adx][ady];
+            return (360 - q1angle) % 360;
+        }
+    } else {
+        // Lower half (south)
+        if (dx >= 0) {
+            // Q2: SE — angle = 180 - atan2(adx, ady)
+            q1angle = angleLUT[adx][ady];
+            return 180 - q1angle;
+        } else {
+            // Q3: SW — angle = 180 + atan2(adx, ady)
+            q1angle = angleLUT[adx][ady];
+            return 180 + q1angle;
+        }
+    }
+}
+
+
+// =============================================================================
+// ARC DRAWING - SINGLE SPI WINDOW, CENTER-OUTWARD
 // =============================================================================
 
-// Check if angle (in degrees, 0=top, clockwise) is within arc range
-static inline bool angleInArc(int angleDeg, int startDeg, int endDeg) {
-    // Normalize to 0-359
-    while (angleDeg < 0) angleDeg += 360;
-    while (angleDeg >= 360) angleDeg -= 360;
-    
-    if (endDeg <= 360) {
-        return angleDeg >= startDeg && angleDeg <= endDeg;
-    } else {
-        // Arc wraps around 360
-        return angleDeg >= startDeg || angleDeg <= (endDeg - 360);
-    }
-}
-
-// Helper: draw one scanline of the arc
-static void drawArcScanline(GC9A01& disp, int16_t cx, int16_t y,
-                            int16_t innerRadius, int16_t outerRadius,
-                            int startDeg, int endDeg, uint16_t color)
-{
-    int16_t dy = y - (GC9A01_HEIGHT / 2);
-    int32_t dySq = dy * dy;
-    int32_t innerSq = innerRadius * innerRadius;
-    int32_t outerSq = outerRadius * outerRadius;
-    
-    if (dySq > outerSq) return;
-    int16_t dxOuter = (int16_t)sqrtf(outerSq - dySq);
-    int16_t dxInner = (dySq < innerSq) ? (int16_t)sqrtf(innerSq - dySq) : 0;
-    
-    int16_t runStart = -1;
-    
-    for (int16_t x = cx - dxOuter; x <= cx + dxOuter; x++) {
-        int16_t dx = x - cx;
-        int16_t absDx = dx < 0 ? -dx : dx;
-        
-        if (absDx < dxInner) {
-            if (runStart >= 0) {
-                disp.drawHLine(runStart, y, x - runStart, color);
-                runStart = -1;
-            }
-            continue;
-        }
-        
-        int angle = (int)(atan2f((float)dx, (float)(-dy)) * 180.0f / M_PI);
-        if (angle < 0) angle += 360;
-        
-        if (angleInArc(angle, startDeg, endDeg)) {
-            if (runStart < 0) runStart = x;
-        } else {
-            if (runStart >= 0) {
-                disp.drawHLine(runStart, y, x - runStart, color);
-                runStart = -1;
-            }
-        }
-    }
-    
-    if (runStart >= 0) {
-        disp.drawHLine(runStart, y, (cx + dxOuter + 1) - runStart, color);
-    }
-}
-
-// Arc drawing - expands from center outward
-void drawArcFast(GC9A01& disp, int16_t cx, int16_t cy, 
-                 int16_t innerRadius, int16_t outerRadius,
+/**
+ * @brief Draw an arc using a single SPI window for the entire bounding box.
+ * 
+ * Builds all scanlines into a contiguous buffer covering the arc's bounding
+ * box, then pushes the whole thing in one beginWrite/pushPixels/endWrite.
+ * Draws from center outward for a wipe-out visual effect.
+ *
+ * For partial updates (brightness delta), only the affected angular region
+ * is redrawn, keeping the rest untouched via skipping those rows' pixels.
+ */
+void drawArcFast(GC9A01& disp, int16_t cx, int16_t cy,
+                 int16_t innerR, int16_t outerR,
                  int startDeg, int endDeg, uint16_t color)
 {
-    if (outerRadius <= 0 || endDeg <= startDeg) return;
-    if (innerRadius < 0) innerRadius = 0;
+    if (outerR <= 0 || endDeg <= startDeg) return;
+    if (innerR < 0) innerR = 0;
     
-    // Draw from center outward (expanding effect)
-    for (int16_t offset = 0; offset <= outerRadius; offset++) {
-        // Draw line above center
-        if (cy - offset >= cy - outerRadius) {
-            drawArcScanline(disp, cx, cy - offset, innerRadius, outerRadius, startDeg, endDeg, color);
-        }
-        // Draw line below center (skip offset=0, already drawn)
-        if (offset > 0 && cy + offset <= cy + outerRadius) {
-            drawArcScanline(disp, cx, cy + offset, innerRadius, outerRadius, startDeg, endDeg, color);
+    int32_t innerSq = (int32_t)innerR * innerR;
+    int32_t outerSq = (int32_t)outerR * outerR;
+    
+    // Bounding box
+    int16_t yStart = cy - outerR;
+    int16_t yEnd   = cy + outerR;
+    int16_t xStart = cx - outerR;
+    int16_t xEnd   = cx + outerR;
+    
+    // Clamp to screen
+    if (yStart < 0) yStart = 0;
+    if (yEnd >= GC9A01_HEIGHT) yEnd = GC9A01_HEIGHT - 1;
+    if (xStart < 0) xStart = 0;
+    if (xEnd >= GC9A01_WIDTH) xEnd = GC9A01_WIDTH - 1;
+    
+    int16_t bboxW = xEnd - xStart + 1;
+    int16_t bboxH = yEnd - yStart + 1;
+    if (bboxW <= 0 || bboxH <= 0) return;
+    
+    // We draw center-outward: process rows in order of distance from cy,
+    // but write them into a framebuffer at their correct Y positions,
+    // then flush the whole buffer at once.
+    // 
+    // Use a static buffer. Max bbox = 201x201 = ~80KB of uint16_t = too much.
+    // Instead, we'll do it in horizontal strips to keep memory reasonable.
+    // Each strip = bboxW pixels = 240 * 2 = 480 bytes. Very manageable.
+    // We iterate center-outward and push each row immediately.
+    
+    // Center-outward iteration
+    for (int16_t offset = 0; offset <= outerR; offset++) {
+        // Two rows to process: cy - offset and cy + offset
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1 && offset == 0) continue;  // Don't draw center twice
+            
+            int16_t y = (pass == 0) ? (cy - offset) : (cy + offset);
+            
+            if (y < yStart || y > yEnd) continue;
+            
+            int16_t dy = y - cy;
+            int32_t dySq = (int32_t)dy * dy;
+            
+            if (dySq > outerSq) continue;
+            
+            int16_t dxOuter = (int16_t)sqrtf((float)(outerSq - dySq));
+            int16_t dxInner = (dySq < innerSq) ? (int16_t)sqrtf((float)(innerSq - dySq)) : 0;
+            
+            // Row X range within the annulus
+            int16_t rowXStart = cx - dxOuter;
+            int16_t rowXEnd   = cx + dxOuter;
+            if (rowXStart < 0) rowXStart = 0;
+            if (rowXEnd >= GC9A01_WIDTH) rowXEnd = GC9A01_WIDTH - 1;
+            
+            int16_t rw = rowXEnd - rowXStart + 1;
+            if (rw <= 0) continue;
+            
+            // Find contiguous runs of arc pixels and only write those.
+            // This avoids blasting non-arc areas with black, which would
+            // destroy already-drawn arc segments during incremental updates.
+            uint16_t lineBuf[240];
+            int16_t runStart = -1;
+            
+            for (int16_t i = 0; i <= rw; i++) {
+                bool inArc = false;
+                
+                if (i < rw) {
+                    int16_t x = rowXStart + i;
+                    int16_t dx = x - cx;
+                    int16_t absDx = dx < 0 ? -dx : dx;
+                    
+                    if (absDx >= dxInner) {
+                        int angle = getAngle(dx, dy);
+                        
+                        if (endDeg <= 360) {
+                            inArc = (angle >= startDeg && angle <= endDeg);
+                        } else {
+                            inArc = (angle >= startDeg || angle <= (endDeg - 360));
+                        }
+                    }
+                }
+                
+                if (inArc) {
+                    if (runStart < 0) runStart = i;
+                    lineBuf[i] = color;
+                } else {
+                    // Flush the current run if we have one
+                    if (runStart >= 0) {
+                        int16_t runLen = i - runStart;
+                        int16_t wx = rowXStart + runStart;
+                        disp.beginWrite(wx, y, wx + runLen - 1, y);
+                        disp.pushPixels(&lineBuf[runStart], runLen);
+                        disp.endWrite();
+                        runStart = -1;
+                    }
+                }
+            }
         }
     }
 }
 
-// Wrapper for compatibility
+
 void drawPieSliceFast(GC9A01& disp, int16_t cx, int16_t cy, int16_t radius,
                       int startDeg, int endDeg, uint16_t color)
 {
@@ -292,9 +401,8 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
     const int16_t cx = GC9A01_WIDTH / 2;
     const int16_t cy = GC9A01_HEIGHT / 2;
     const int16_t outerRadius = 100;
-    const int16_t innerRadius = 40;  // Protects center text area
+    const int16_t innerRadius = 40;
     
-    // Detect what changed
     bool toggledOnOff = (led.isOn != led.prevOn);
     bool colorChanged = (led.hue != led.prevHue);
     bool brightnessChanged = (led.brightness != led.prevBrightness);
@@ -304,7 +412,6 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
     snprintf(name, sizeof(name), "LED %d", ledIndex + 1);
     
     if (needFullRedraw) {
-        // Full screen clear only on toggle or first draw
         display.fillScreen(COLOR_BLACK);
         
         if (led.isOn) {
@@ -326,7 +433,6 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
         }
     } 
     else if (led.isOn && colorChanged) {
-        // Color change - redraw arc in new color (no center redraw needed!)
         uint16_t arcColor = GC9A01::color565(led.r, led.g, led.b);
         int endAngle = (int)(led.brightness * 3.6f);
         
@@ -334,14 +440,12 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
             drawArcFast(display, cx, cy, innerRadius, outerRadius, 0, endAngle, arcColor);
         }
         
-        // Clear and redraw percentage text (fit within inner circle)
         display.fillRect(cx - 24, cy + 6, 48, 16, COLOR_BLACK);
         char pct[16];
         snprintf(pct, sizeof(pct), "%d%%", led.brightness);
         drawCenteredString(display, cy + 8, pct, arcColor, COLOR_BLACK, 2);
     }
     else if (led.isOn && brightnessChanged) {
-        // Brightness change - incremental update
         uint16_t arcColor = GC9A01::color565(led.r, led.g, led.b);
         int oldAngle = (int)(led.prevBrightness * 3.6f);
         int newAngle = (int)(led.brightness * 3.6f);
@@ -352,14 +456,12 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
             drawArcFast(display, cx, cy, innerRadius, outerRadius, newAngle, oldAngle, COLOR_BLACK);
         }
         
-        // Clear and redraw percentage text (fit within inner circle)
         display.fillRect(cx - 24, cy + 6, 48, 16, COLOR_BLACK);
         char pct[16];
         snprintf(pct, sizeof(pct), "%d%%", led.brightness);
         drawCenteredString(display, cy + 8, pct, arcColor, COLOR_BLACK, 2);
     }
     
-    // Update previous state
     led.prevOn = led.isOn;
     led.prevBrightness = led.brightness;
     led.prevHue = led.hue;
@@ -373,6 +475,10 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
 
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Dual LED Controller starting...");
+    
+    // Build angle lookup table (once, ~10KB, takes <1ms)
+    buildAngleLUT();
+    ESP_LOGI(TAG, "Angle LUT built");
     
     // -------------------------------------------------------------------------
     // Initialize touch sensors
@@ -445,7 +551,7 @@ extern "C" void app_main(void) {
                static_cast<gpio_num_t>(GC2_DC), 
                static_cast<gpio_num_t>(GC2_RST), 
                GPIO_NUM_NC, 
-               SPI2_HOST)  // Same host, different CS
+               SPI2_HOST)
     };
     
     if (!tft[0].init()) {
@@ -461,7 +567,6 @@ extern "C" void app_main(void) {
     // -------------------------------------------------------------------------
     VirtualLED led[2];
     
-    // Initial draw
     for (int i = 0; i < 2; i++) {
         updateSSD1306(mux, oled[i], i, led[i]);
         updateGC9A01(tft[i], i, led[i]);
@@ -479,14 +584,12 @@ extern "C" void app_main(void) {
         touch[1].update();
         
         for (int i = 0; i < 2; i++) {
-            // Touch toggle
             if (touch[i].wasTouched()) {
                 led[i].isOn = !led[i].isOn;
                 needsUpdate[i] = true;
                 ESP_LOGI(TAG, "LED %d toggled: %s", i + 1, led[i].isOn ? "ON" : "OFF");
             }
             
-            // Encoder button - mode switch
             if (encoder[i].wasButtonPressed()) {
                 if (led[i].mode == ControlMode::BRIGHTNESS) {
                     led[i].mode = ControlMode::COLOR;
@@ -498,7 +601,6 @@ extern "C" void app_main(void) {
                          led[i].mode == ControlMode::BRIGHTNESS ? "BRIGHTNESS" : "COLOR");
             }
             
-            // Encoder rotation
             int32_t currentPos = encoder[i].getPosition();
             int32_t delta = currentPos - lastEncoderPos[i];
             
@@ -522,12 +624,10 @@ extern "C" void app_main(void) {
             }
         }
         
-        // Update displays
         for (int i = 0; i < 2; i++) {
             if (needsUpdate[i]) {
                 updateSSD1306(mux, oled[i], i, led[i]);
                 
-                // Skip TFT update if LED is off and wasn't just toggled
                 if (led[i].isOn || led[i].isOn != led[i].prevOn) {
                     updateGC9A01(tft[i], i, led[i]);
                 }

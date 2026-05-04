@@ -138,7 +138,7 @@ bool GC9A01::init() {
      * -------------------------------------------------------------------------
      */
     spi_device_interface_config_t devConfig = {};
-    devConfig.clock_speed_hz = 20 * 1000 * 1000;    // 40 MHz
+    devConfig.clock_speed_hz = 40 * 1000 * 1000;    // 40 MHz
     devConfig.mode = 0;                              // SPI mode 0
     devConfig.spics_io_num = csPin;
     devConfig.queue_size = 7;
@@ -877,6 +877,40 @@ void GC9A01::setNormalMode() {
 
 bool GC9A01::isPartialMode() const {
     return partialMode;
+}
+
+
+void GC9A01::beginWrite(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+    setWindow(x0, y0, x1, y1);
+    gpio_set_level(dcPin, 1);  // Data mode for pixel streaming
+}
+
+
+void GC9A01::pushPixels(const uint16_t* colors, int32_t count) {
+    if (count <= 0) return;
+    
+    // Swap bytes for SPI (big-endian) and send in chunks
+    uint8_t buf[512];
+    int32_t sent = 0;
+    
+    while (sent < count) {
+        int bufIdx = 0;
+        while (bufIdx < 510 && sent < count) {
+            buf[bufIdx++] = colors[sent] >> 8;
+            buf[bufIdx++] = colors[sent] & 0xFF;
+            sent++;
+        }
+        
+        spi_transaction_t trans = {};
+        trans.length = bufIdx * 8;
+        trans.tx_buffer = buf;
+        spi_device_polling_transmit(spiDevice, &trans);
+    }
+}
+
+
+void GC9A01::endWrite() {
+    // No-op for now, reserved for future DMA completion wait
 }
 
 

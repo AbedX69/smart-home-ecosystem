@@ -444,6 +444,33 @@ public:
     static uint16_t color565(uint8_t r, uint8_t g, uint8_t b);
 
 
+    /**
+     * @brief Begin a batch pixel write to a rectangular window.
+     *
+     * After calling this, use pushPixel/pushPixels to stream pixel data,
+     * then call endWrite(). Avoids per-scanline SPI window setup overhead.
+     *
+     * @param x0 Start X.
+     * @param y0 Start Y.
+     * @param x1 End X.
+     * @param y1 End Y.
+     */
+    void beginWrite(int16_t x0, int16_t y0, int16_t x1, int16_t y1);
+
+    /**
+     * @brief Push a row of pixels into the current write window.
+     *
+     * @param colors Array of RGB565 pixel values.
+     * @param count Number of pixels.
+     */
+    void pushPixels(const uint16_t* colors, int32_t count);
+
+    /**
+     * @brief End a batch pixel write (no-op, for future use).
+     */
+    void endWrite();
+
+
 private:
 
     gpio_num_t mosiPin;
