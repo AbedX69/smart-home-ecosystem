@@ -1,6 +1,6 @@
 /**
  * @file main.cpp
- * @brief Demo: 2 virtual LEDs with touch, encoders, and dual display types
+ * @brief Demo: 2 virtual LEDs with touch, encoders, and dual GC9A01 displays
  *
  * HARDWARE SETUP (ESP32-S3):
  * 
@@ -9,12 +9,6 @@
  *     Touch 2:      GPIO 5
  *     Encoder 1:    CLK=6, DT=7, SW=15
  *     Encoder 2:    CLK=16, DT=17, SW=18
- *
- *   I2C (PCA9548A mux → 2x SSD1306):
- *     SDA:          GPIO 8
- *     SCL:          GPIO 9
- *     Mux CH0:      SSD1306 #1
- *     Mux CH1:      SSD1306 #2
  *
  *   SPI (shared bus → 2x GC9A01):
  *     MOSI:         GPIO 11
@@ -32,8 +26,6 @@
 
 #include "touch.h"
 #include "encoder.h"
-#include "pca9548a.h"
-#include "ssd1306.h"
 #include "gc9a01.h"
 
 static const char* TAG = "DualLED";
@@ -68,13 +60,6 @@ static const char* TAG = "DualLED";
 #endif
 #ifndef ENC2_SW
 #define ENC2_SW         18
-#endif
-
-#ifndef I2C_SDA
-#define I2C_SDA         8
-#endif
-#ifndef I2C_SCL
-#define I2C_SCL         9
 #endif
 
 #ifndef SPI_MOSI
@@ -115,13 +100,15 @@ static const char* TAG = "DualLED";
 
 enum class ControlMode {
     BRIGHTNESS,
-    COLOR
+    COLOR,
+    WHITE
 };
 
 struct VirtualLED {
     bool        isOn       = false;
     uint8_t     brightness = 50;
     uint16_t    hue        = 0;
+    uint8_t     whiteBright = 0;      // White channel 0-100%
     ControlMode mode       = ControlMode::BRIGHTNESS;
     uint8_t     r = 255;
     uint8_t     g = 0;
@@ -131,6 +118,8 @@ struct VirtualLED {
     bool        prevOn         = false;
     uint8_t     prevBrightness = 0;
     uint16_t    prevHue        = 0;
+    uint8_t     prevWhiteBright = 0;
+    ControlMode prevMode       = ControlMode::BRIGHTNESS;
     bool        forceRedraw    = true;  // First draw
 };
 
@@ -373,29 +362,6 @@ void drawCenteredString(GC9A01& disp, int16_t cy, const char* str,
 // DISPLAY UPDATE FUNCTIONS
 // =============================================================================
 
-void updateSSD1306(PCA9548A& mux, SSD1306& display, int ledIndex, const VirtualLED& led) {
-    mux.selectChannel(ledIndex);
-    display.setInverted(led.isOn);
-    display.clear();
-    
-    char line1[24];
-    snprintf(line1, sizeof(line1), "LED %d: %s", ledIndex + 1, led.isOn ? "ON" : "OFF");
-    display.drawString(0, 0, line1);
-    
-    char line2[24];
-    snprintf(line2, sizeof(line2), "Brightness: %d%%", led.brightness);
-    display.drawString(0, 24, line2);
-    
-    char line3[24];
-    snprintf(line3, sizeof(line3), "(%d,%d,%d)", led.r, led.g, led.b);
-    display.drawString(0, 48, line3);
-    
-    const char* modeStr = (led.mode == ControlMode::BRIGHTNESS) ? "[B]" : "[C]";
-    display.drawString(104, 0, modeStr);
-    
-    display.update();
-}
-
 
 void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
     const int16_t cx = GC9A01_WIDTH / 2;
@@ -406,47 +372,57 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
     bool toggledOnOff = (led.isOn != led.prevOn);
     bool colorChanged = (led.hue != led.prevHue);
     bool brightnessChanged = (led.brightness != led.prevBrightness);
-    bool needFullRedraw = led.forceRedraw || toggledOnOff;
+    bool whiteChanged = (led.whiteBright != led.prevWhiteBright);
+    bool modeChanged = (led.mode != led.prevMode);
+    bool needFullRedraw = led.forceRedraw || toggledOnOff || modeChanged;
     
     char name[16];
     snprintf(name, sizeof(name), "LED %d", ledIndex + 1);
+    
+    // In WHITE mode, arc shows white brightness in white color
+    // In BRIGHTNESS/COLOR modes, arc shows brightness in hue color
+    bool inWhiteMode = (led.mode == ControlMode::WHITE);
+    uint8_t  arcLevel = inWhiteMode ? led.whiteBright : led.brightness;
+    uint16_t arcColor = inWhiteMode ? COLOR_WHITE : GC9A01::color565(led.r, led.g, led.b);
     
     if (needFullRedraw) {
         display.fillScreen(COLOR_BLACK);
         
         if (led.isOn) {
-            uint16_t arcColor = GC9A01::color565(led.r, led.g, led.b);
-            
-            if (led.brightness > 0) {
-                int endAngle = (int)(led.brightness * 3.6f);
+            if (arcLevel > 0) {
+                int endAngle = (int)(arcLevel * 3.6f);
                 drawArcFast(display, cx, cy, innerRadius, outerRadius, 0, endAngle, arcColor);
             }
             
             drawCenteredString(display, cy - 16, name, COLOR_WHITE, COLOR_BLACK, 2);
             
             char pct[16];
-            snprintf(pct, sizeof(pct), "%d%%", led.brightness);
-            drawCenteredString(display, cy + 8, pct, arcColor, COLOR_BLACK, 2);
+            snprintf(pct, sizeof(pct), "%d%%", arcLevel);
+            drawCenteredString(display, cy + 4, pct, arcColor, COLOR_BLACK, 2);
+            
+            // Mode indicator
+            const char* modeStr = inWhiteMode ? "WHITE" : 
+                                  (led.mode == ControlMode::COLOR) ? "COLOR" : "RGB";
+            drawCenteredString(display, cy + 22, modeStr, COLOR_GRAY, COLOR_BLACK, 1);
         } else {
             drawCenteredString(display, cy - 8, name, COLOR_GRAY, COLOR_BLACK, 2);
             drawCenteredString(display, cy + 16, "OFF", COLOR_GRAY, COLOR_BLACK, 2);
         }
     } 
-    else if (led.isOn && colorChanged) {
-        uint16_t arcColor = GC9A01::color565(led.r, led.g, led.b);
+    else if (led.isOn && !inWhiteMode && colorChanged) {
+        // Color hue changed — redraw arc in new color
         int endAngle = (int)(led.brightness * 3.6f);
-        
         if (led.brightness > 0) {
             drawArcFast(display, cx, cy, innerRadius, outerRadius, 0, endAngle, arcColor);
         }
         
-        display.fillRect(cx - 24, cy + 6, 48, 16, COLOR_BLACK);
+        display.fillRect(cx - 30, cy + 2, 60, 16, COLOR_BLACK);
         char pct[16];
         snprintf(pct, sizeof(pct), "%d%%", led.brightness);
-        drawCenteredString(display, cy + 8, pct, arcColor, COLOR_BLACK, 2);
+        drawCenteredString(display, cy + 4, pct, arcColor, COLOR_BLACK, 2);
     }
-    else if (led.isOn && brightnessChanged) {
-        uint16_t arcColor = GC9A01::color565(led.r, led.g, led.b);
+    else if (led.isOn && !inWhiteMode && brightnessChanged) {
+        // RGB brightness changed — incremental arc update
         int oldAngle = (int)(led.prevBrightness * 3.6f);
         int newAngle = (int)(led.brightness * 3.6f);
         
@@ -456,15 +432,33 @@ void updateGC9A01(GC9A01& display, int ledIndex, VirtualLED& led) {
             drawArcFast(display, cx, cy, innerRadius, outerRadius, newAngle, oldAngle, COLOR_BLACK);
         }
         
-        display.fillRect(cx - 24, cy + 6, 48, 16, COLOR_BLACK);
+        display.fillRect(cx - 30, cy + 2, 60, 16, COLOR_BLACK);
         char pct[16];
         snprintf(pct, sizeof(pct), "%d%%", led.brightness);
-        drawCenteredString(display, cy + 8, pct, arcColor, COLOR_BLACK, 2);
+        drawCenteredString(display, cy + 4, pct, arcColor, COLOR_BLACK, 2);
+    }
+    else if (led.isOn && inWhiteMode && whiteChanged) {
+        // White brightness changed — incremental arc update in white
+        int oldAngle = (int)(led.prevWhiteBright * 3.6f);
+        int newAngle = (int)(led.whiteBright * 3.6f);
+        
+        if (newAngle > oldAngle) {
+            drawArcFast(display, cx, cy, innerRadius, outerRadius, oldAngle, newAngle, COLOR_WHITE);
+        } else {
+            drawArcFast(display, cx, cy, innerRadius, outerRadius, newAngle, oldAngle, COLOR_BLACK);
+        }
+        
+        display.fillRect(cx - 30, cy + 2, 60, 16, COLOR_BLACK);
+        char pct[16];
+        snprintf(pct, sizeof(pct), "%d%%", led.whiteBright);
+        drawCenteredString(display, cy + 4, pct, COLOR_WHITE, COLOR_BLACK, 2);
     }
     
     led.prevOn = led.isOn;
     led.prevBrightness = led.brightness;
     led.prevHue = led.hue;
+    led.prevWhiteBright = led.whiteBright;
+    led.prevMode = led.mode;
     led.forceRedraw = false;
 }
 
@@ -508,33 +502,6 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Encoders initialized");
     
     // -------------------------------------------------------------------------
-    // Initialize I2C mux and SSD1306 displays
-    // -------------------------------------------------------------------------
-    PCA9548A mux(static_cast<gpio_num_t>(I2C_SDA), 
-                 static_cast<gpio_num_t>(I2C_SCL));
-    if (!mux.init()) {
-        ESP_LOGE(TAG, "Failed to init I2C mux!");
-        return;
-    }
-    ESP_LOGI(TAG, "I2C mux initialized");
-    
-    SSD1306 oled[2] = {
-        SSD1306(mux.getBusHandle(), SSD1306_ADDR_DEFAULT),
-        SSD1306(mux.getBusHandle(), SSD1306_ADDR_DEFAULT)
-    };
-    
-    mux.selectChannel(0);
-    if (!oled[0].init()) {
-        ESP_LOGE(TAG, "Failed to init OLED 0!");
-    }
-    
-    mux.selectChannel(1);
-    if (!oled[1].init()) {
-        ESP_LOGE(TAG, "Failed to init OLED 1!");
-    }
-    ESP_LOGI(TAG, "SSD1306 displays initialized");
-    
-    // -------------------------------------------------------------------------
     // Initialize GC9A01 displays
     // -------------------------------------------------------------------------
     GC9A01 tft[2] = {
@@ -568,7 +535,6 @@ extern "C" void app_main(void) {
     VirtualLED led[2];
     
     for (int i = 0; i < 2; i++) {
-        updateSSD1306(mux, oled[i], i, led[i]);
         updateGC9A01(tft[i], i, led[i]);
     }
     
@@ -591,14 +557,14 @@ extern "C" void app_main(void) {
             }
             
             if (encoder[i].wasButtonPressed()) {
-                if (led[i].mode == ControlMode::BRIGHTNESS) {
-                    led[i].mode = ControlMode::COLOR;
-                } else {
-                    led[i].mode = ControlMode::BRIGHTNESS;
+                switch (led[i].mode) {
+                    case ControlMode::BRIGHTNESS: led[i].mode = ControlMode::COLOR; break;
+                    case ControlMode::COLOR:      led[i].mode = ControlMode::WHITE; break;
+                    case ControlMode::WHITE:      led[i].mode = ControlMode::BRIGHTNESS; break;
                 }
                 needsUpdate[i] = true;
-                ESP_LOGI(TAG, "LED %d mode: %s", i + 1, 
-                         led[i].mode == ControlMode::BRIGHTNESS ? "BRIGHTNESS" : "COLOR");
+                const char* modeNames[] = {"BRIGHTNESS", "COLOR", "WHITE"};
+                ESP_LOGI(TAG, "LED %d mode: %s", i + 1, modeNames[(int)led[i].mode]);
             }
             
             int32_t currentPos = encoder[i].getPosition();
@@ -607,17 +573,26 @@ extern "C" void app_main(void) {
             if (delta != 0) {
                 lastEncoderPos[i] = currentPos;
                 
+                // Ignore rotation when LED is off
+                if (!led[i].isOn) continue;
+                
                 if (led[i].mode == ControlMode::BRIGHTNESS) {
                     int newBright = led[i].brightness + delta;
                     if (newBright < 0) newBright = 0;
                     if (newBright > 100) newBright = 100;
                     led[i].brightness = (uint8_t)newBright;
-                } else {
+                } else if (led[i].mode == ControlMode::COLOR) {
                     int newHue = led[i].hue + (delta * 5);
                     while (newHue < 0) newHue += 360;
                     while (newHue >= 360) newHue -= 360;
                     led[i].hue = (uint16_t)newHue;
                     hueToRgb(led[i].hue, led[i].r, led[i].g, led[i].b);
+                } else {
+                    // WHITE mode
+                    int newWhite = led[i].whiteBright + delta;
+                    if (newWhite < 0) newWhite = 0;
+                    if (newWhite > 100) newWhite = 100;
+                    led[i].whiteBright = (uint8_t)newWhite;
                 }
                 
                 needsUpdate[i] = true;
@@ -626,8 +601,6 @@ extern "C" void app_main(void) {
         
         for (int i = 0; i < 2; i++) {
             if (needsUpdate[i]) {
-                updateSSD1306(mux, oled[i], i, led[i]);
-                
                 if (led[i].isOn || led[i].isOn != led[i].prevOn) {
                     updateGC9A01(tft[i], i, led[i]);
                 }
