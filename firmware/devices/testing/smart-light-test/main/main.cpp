@@ -1,12 +1,10 @@
 /**
  * @file main.cpp
- * @brief Bench test for SmartLightRemote: 2 panels, touch + encoder per side.
+ * @brief Bench test for SmartLight: 2 panels + 2 SK6812 RGBW strips, wired.
  *
- * Wires:
- *   - 2x SmartLightRemote   (from devices/modules/smart_light)
- *   - 2x TouchSensor        (toggle on touch)
- *   - 2x RotaryEncoder      (rotate = adjust, button = cycle mode)
- *   - 2x GC9A01 displays    (shared SPI bus)
+ * Same ESP32-S3 runs both the remote UI (GC9A01 panels) and the device
+ * hardware (LED strips). No wireless — state is synced directly in the
+ * main loop.
  *
  * INPUT MAPPING
  *   Touch tap     → toggle panel on/off
@@ -24,6 +22,8 @@
  *   SPI:        MOSI=11, SCK=12
  *   Display 1:  CS=38, DC=39, RST=40, BLK=3
  *   Display 2:  CS=21, DC=47, RST=48
+ *   Strip 1:    GPIO 1   (SK6812 RGBW, 144 LEDs)
+ *   Strip 2:    GPIO 2   (SK6812 RGBW, 144 LEDs)
  */
 
 #include <freertos/FreeRTOS.h>
@@ -34,6 +34,7 @@
 #include "touch.h"
 #include "encoder.h"
 #include "smart_light_remote.h"
+#include "smart_light_device.h"
 
 static const char* TAG = "test_smart_light";
 
@@ -64,13 +65,13 @@ static const char* TAG = "test_smart_light";
 
 #define GC_BLK       GPIO_NUM_3
 
+#define STRIP1_PIN   GPIO_NUM_41
+#define STRIP2_PIN   GPIO_NUM_42
+#define NUM_LEDS     144
+
 
 /* ─── Per-channel input handler ──────────────────────────────────────────── */
-/*
- * Pulls pending events from one (touch, encoder) pair and applies them to
- * the matching SmartLightRemote. Returns true if state changed (caller
- * should re-render).
- */
+
 static bool handleInputs(int idx,
                          TouchSensor& touch,
                          RotaryEncoder& enc,
@@ -110,17 +111,32 @@ static bool handleInputs(int idx,
 }
 
 
+/**
+ * @brief Sync remote panel state → device strip.
+ *
+ * Copies on/off, brightness, hue, and white from the SmartLightRemote
+ * into the SmartLightDevice, then pushes to hardware.
+ */
+static void syncToDevice(SmartLightRemote& panel, SmartLightDevice& device) {
+    device.setOn(panel.isOn());
+    device.setBrightness(panel.brightness());
+    device.setHue(panel.hue());
+    device.setWhite(panel.whiteBright());
+    device.update();
+}
+
+
 /* ─── app_main ───────────────────────────────────────────────────────────── */
 
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "Smart-light bench test starting...");
+    ESP_LOGI(TAG, "Smart-light bench test starting (wired)...");
 
-    /* 1. Build the angle LUT used by the panel renderer (once). */
+    /* 1. Angle LUT for panel renderer. */
     SmartLightRemote::buildAngleLUT();
 
-    /* 2. Displays (shared SPI). */
-    GC9A01 tft0(SPI_MOSI, SPI_SCK, GC1_CS, GC1_DC, GC1_RST, GC_BLK,        SPI2_HOST);
-    GC9A01 tft1(SPI_MOSI, SPI_SCK, GC2_CS, GC2_DC, GC2_RST, GPIO_NUM_NC,   SPI2_HOST);
+    /* 2. Displays. */
+    GC9A01 tft0(SPI_MOSI, SPI_SCK, GC1_CS, GC1_DC, GC1_RST, GC_BLK,      SPI2_HOST);
+    GC9A01 tft1(SPI_MOSI, SPI_SCK, GC2_CS, GC2_DC, GC2_RST, GPIO_NUM_NC, SPI2_HOST);
     if (!tft0.init()) ESP_LOGE(TAG, "TFT 0 init failed");
     if (!tft1.init()) ESP_LOGE(TAG, "TFT 1 init failed");
 
@@ -134,18 +150,28 @@ extern "C" void app_main(void) {
     enc0.init();
     enc1.init();
 
-    /* 4. Two panels, one per display. */
+    /* 4. Remote panels (UI). */
     SmartLightRemote panel0(tft0, 0);
     SmartLightRemote panel1(tft1, 1);
+
+    /* 5. Device strips (hardware). */
+    SmartLightDevice strip0(STRIP1_PIN, NUM_LEDS);
+    SmartLightDevice strip1(STRIP2_PIN, NUM_LEDS);
+
+    if (!strip0.init()) ESP_LOGE(TAG, "Strip 0 init failed");
+    if (!strip1.init()) ESP_LOGE(TAG, "Strip 1 init failed");
+    ESP_LOGI(TAG, "SK6812 RGBW strips initialized (2x %d LEDs)", NUM_LEDS);
 
     int32_t lastEnc0 = 0;
     int32_t lastEnc1 = 0;
 
-    /* 5. Initial paint. */
+    /* 6. Initial paint + sync. */
     panel0.invalidate();
     panel1.invalidate();
     panel0.render();
     panel1.render();
+    syncToDevice(panel0, strip0);
+    syncToDevice(panel1, strip1);
 
     ESP_LOGI(TAG, "Entering main loop...");
 
@@ -156,8 +182,14 @@ extern "C" void app_main(void) {
         bool dirty0 = handleInputs(0, touch0, enc0, lastEnc0, panel0);
         bool dirty1 = handleInputs(1, touch1, enc1, lastEnc1, panel1);
 
-        if (dirty0) panel0.render();
-        if (dirty1) panel1.render();
+        if (dirty0) {
+            panel0.render();
+            syncToDevice(panel0, strip0);
+        }
+        if (dirty1) {
+            panel1.render();
+            syncToDevice(panel1, strip1);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }

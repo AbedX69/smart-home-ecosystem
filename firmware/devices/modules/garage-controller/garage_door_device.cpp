@@ -38,8 +38,8 @@ GarageDoorDevice::~GarageDoorDevice() {
 bool GarageDoorDevice::init() {
     ESP_LOGI(TAG, "Initializing garage door device");
 
-    if (!_up_relay.init())   { ESP_LOGE(TAG, "UP relay init failed");   return false; }
-    if (!_down_relay.init()) { ESP_LOGE(TAG, "DOWN relay init failed"); return false; }
+    _up_relay.init();
+    _down_relay.init();
 
     _up_btn.init();
     _down_btn.init();

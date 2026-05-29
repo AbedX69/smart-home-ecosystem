@@ -148,7 +148,7 @@ extern "C" void app_main(void) {
 
     LoRaConfig config;
     config.frequency = 915000000;       // 915 MHz (US ISM band)
-    config.spreading_factor = 12;        // Fast, ~2km range
+    config.spreading_factor = 7;        // Fast, ~2km range
     config.bandwidth = 4;               // 125 kHz 
     config.coding_rate = 1;             // 4/5
     config.tx_power = 22;              // Max power
@@ -215,8 +215,11 @@ while (true) {
 
     lora.setRxCallback(onPingPong);
 
-    uint8_t node_id = 0x01;  // Change to 0x01 for ping sender
-
+#ifdef LORA_RESPONDER
+    uint8_t node_id = 0x02;  // responder
+#else
+    uint8_t node_id = 0x01;  // ping sender
+#endif
 
     if (node_id == 0x01) {
         /* Ping sender */

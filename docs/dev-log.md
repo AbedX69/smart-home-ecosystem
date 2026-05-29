@@ -1746,3 +1746,96 @@ while (waiting_pong &&
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+# Dev Log — May 19, 2026
+
+## Project: Smart Light (SK6812 RGBW LED Strip Integration)
+
+---
+
+### Goal
+Integrate SK6812 RGBW 4000K LED strips (144 LEDs each, ×2) into the smart light system — both the `SmartLightDevice` driver and the bench test wiring.
+
+---
+
+### What got done
+
+**SmartLightDevice implemented** — was a stub, now fully functional. Takes a GPIO pin + LED count, owns an `AddressableLED` strip internally. State surface mirrors `SmartLightRemote`: on/off, brightness (0-100), hue (0-359), white channel (0-100). RGB and white are independent — white isn't derived from RGB, it's a separate 4000K channel controlled via the encoder's WHITE mode.
+
+**Bench test main.cpp updated** — added two `SmartLightDevice` instances alongside the existing two `SmartLightRemote` panels. `syncToDevice()` copies panel state → device state and calls `update()` on each dirty frame. No wireless, direct wired sync on the same ESP32-S3.
+
+**Build issues resolved:**
+- `addressable_led.h` not found → added `-I` paths in `platformio.ini` and fixed `EXTRA_COMPONENT_DIRS` in CMakeLists to only pull needed components (was pulling all of `components/` causing epaper, mosfet_driver etc. to fail)
+- `esp_log` not resolvable as component in PlatformIO's ESP-IDF 5.x → removed from `REQUIRES`, it's globally available
+- `pdMS_TO_TICKS` not declared → added `#include <freertos/FreeRTOS.h>` to `addressable_led.cpp`
+- `mem_block_symbols` must be ≥64 on ESP32D → bumped from 48 to 64
+
+**Hardware debugging:**
+- Strip didn't respond on GPIO 1 or GPIO 2 on ESP32-S3 — those are USB D-/D+ pins, internally pulled for USB
+- Moved to separate ESP32D for isolated testing
+- RMT backend: init succeeds, all test stages run, but zero LEDs respond on GPIO 4 (or 2, or 5)
+- Touching the RX pin (GPIO 3) to the data line lit up 5 LEDs white — confirms strip is alive and wired correctly
+- GPIO 3/RX floods constant HIGH, not controlled data — so strip hardware is fine, signal issue on other GPIOs
+
+**Root cause theory:** RMT output on tested GPIOs isn't producing a clean enough signal for the strip. Could be level/drive strength or a board-specific routing issue.
+
+**Decision:** add SPI backend to `AddressableLED` class instead of continuing to debug RMT GPIO issues.
+
+**SPI backend added to AddressableLED:**
+- New `TransportBackend` enum: `RMT` (default) or `SPI`
+- Constructor gets optional 5th parameter — fully backward compatible, existing code unchanged
+- SPI encoding: each LED data bit → one SPI byte (0xF8 for '1', 0xC0 for '0') at 6.4 MHz clock
+- Produces identical NRZ timing: bit-1 = ~780ns HIGH / ~468ns LOW, bit-0 = ~312ns HIGH / ~937ns LOW
+- DMA-backed transmission — zero CPU during send
+- Reset pulse: 256 bytes of 0x00 appended (≈320µs LOW)
+- SPI buffer allocated with `heap_caps_malloc(MALLOC_CAP_DMA)` for DMA compatibility
+- Auto-selects SPI2_HOST, falls back to SPI3_HOST if SPI2 is busy
+- For 144 SK6812 RGBW LEDs: 144 × 4 × 8 + 256 = 4864 bytes SPI buffer
+
+---
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `components/addressable/addressable_led.h` | Added `TransportBackend` enum, SPI members, `initSpi()`, `showSpi()`, `encodeSpiBuffer()`, `getBackend()` |
+| `components/addressable/addressable_led.cpp` | SPI init/show/encode implementation, `mem_block_symbols` fix, FreeRTOS include |
+| `components/addressable/CMakeLists.txt` | Added `freertos`, `esp_heap` to REQUIRES, removed `esp_log` |
+| `modules/smart-light/smart_light_device.h` | Full implementation (was stub) |
+| `modules/smart-light/smart_light_device.cpp` | Full implementation (was stub) |
+| `modules/smart-light/CMakeLists.txt` | Added `addressable` to REQUIRES |
+| `testing/smart-light-test/main/main.cpp` | Added SmartLightDevice + syncToDevice wired loop |
+| `testing/sk6812-test/` | New test project for isolated strip testing |
+
+---
+
+### Next up
+- Flash SPI backend test on ESP32D (GPIO 13 → DIN)
+- Verify R/G/B/W channels individually — if colors are swapped, adjust ColorOrder
+- Once confirmed working, bring SPI backend back to the S3 smart light bench test
+- Pick non-USB GPIOs on S3 for the two strips (GPIO 41, 42 or similar)
+
+---
+
+### Hardware notes
+- SK6812 RGBW strip: 144 LEDs, 4000K neutral white, single-wire protocol despite "SPI" in product name (3 wires: DIN, VCC, GND)
+- Max current per strip at full RGBW: ~8.6A — need beefy 5V PSU
+- ESP32D GPIO 1/3 are TX/RX — avoid for data. GPIO 2 has boot-mode implications
+- ESP32-S3 GPIO 1/2 are USB — avoid for data
+
+
+
+
+
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################

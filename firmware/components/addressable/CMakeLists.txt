@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "addressable_led.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        freertos
+)
