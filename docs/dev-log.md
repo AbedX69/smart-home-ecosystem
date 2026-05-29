@@ -1833,7 +1833,120 @@ Integrate SK6812 RGBW 4000K LED strips (144 LEDs each, ×2) into the smart light
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+# Dev Log — LoRa Radio Bring-Up Fix (TCXO + B2B Pins) & Antenna Swap
 
+**Date:** 2026-05-29
+**Component:** LoRa SX1262 driver (`communication/lora`), tested via `lora-test` (`-DLORA_TEST_PINGPONG`)
+**Hardware:** 2× XIAO ESP32-S3 + Wio-SX1262 (B2B kit) + external U.FL → SMA whip antennas (915 MHz, 3 dBi)
+**Framework:** ESP-IDF via PlatformIO
+
+---
+
+## Goal
+
+New external whip antennas arrived (replacing the bottlenecked PCB antennas). Get LoRa actually transmitting/receiving again, then re-run the ping-pong range test.
+
+Reality check: the radio turned out to be completely dead on startup — two separate driver bugs had to be fixed before any range testing was possible.
+
+---
+
+## Bugs & Fixes
+
+### 1. BUSY timeout on every command
+
+- **Symptom:** `E LoRaSX1262: BUSY timeout!` repeating from boot, on every SPI command, before init even finished.
+- **Cause:** The `XIAO_S3_WIO_B2B` pin preset had the wrong RST/BUSY/DIO1 pins — `3/4/2` instead of the correct `42/40/39`. NSS (41) and the SPI pins were correct, so the driver talked just enough to print the init banner, but it was polling GPIO4 for BUSY when the real BUSY line is GPIO40 → waited forever, timed out on everything.
+- **Fix:** Corrected the preset to `RST=42 BUSY=40 DIO1=39` (the mapping confirmed working back in April). Also fixed the stale pinout comment block in the header that showed the same wrong numbers.
+
+### 2. TX timeout, RX deaf (after the pin fix)
+
+- **Symptom:** Pins fixed, BUSY timeouts gone, init clean — but every PING gave `TX timeout` and the responder received nothing.
+- **Cause:** The driver never powered the **TCXO**. The Wio-SX1262 uses a temperature-compensated oscillator clocked through the SX1262's DIO3, not a bare crystal. Without `SetDIO3asTCXOCtrl`, the RF PLL can't lock — `SetTx` never completes (→ TX timeout) and the receiver is deaf. The driver also never ran a full `Calibrate(0x7F)`, only `CalibrateImage`.
+- **Fix:** Added `setDio3AsTcxoCtrl()` (DIO3, 1.8 V, 5 ms startup) and `calibrate()` (full `Calibrate(0x7F)`), called in `begin()` right after `STDBY_RC` and before image calibration. First flash after this: PONGs immediately, 0% loss.
+
+### 3. Sender recovery after responder reboot — CONFIRMED FIXED
+
+- **Status:** Not a new bug. The recovery fix landed back in May (don't give the TX semaphore on RX timeouts; drain stale token at top of `send()`). This session **verified it in the field**: the responder rebooted mid-run, the sender ate 2 timeouts while it was actually gone, then resumed on its own with no manual reset. Previously this required power-cycling the sender.
+
+---
+
+## Test Results (indoor — see limitation below)
+
+### Bench (~1 m), antenna sanity check
+
+| Config | RSSI | SNR | RTT | Loss |
+|--------|------|-----|-----|------|
+| SF12 / BW125 | -48 to -66 dBm | +4 to +6 dB | ~1784 ms | 0% (steady state) |
+
+PCB antenna previously read ~-70 dBm at the same distance and couldn't hold a cross-house link at all. Whips give a ~15–20 dB improvement at 1 m.
+
+### Across the house
+
+| Config | RSSI | SNR | RTT | Notes |
+|--------|------|-----|-----|-------|
+| SF12 / BW125 | -100 to -107 dBm | +5 dB | ~1783 ms | Solid once locked; occasional multipath-fade timeouts |
+| SF7 / BW125  | -100 to -107 dBm | +5 to +10 dB | ~128 ms | Holds reliably after lock; startup/fade timeouts at first |
+
+Both spreading factors held a usable link through the whole house with margin to spare — at SF7, ~-105 dBm with SNR +5 still leaves roughly 15 dB before the SF7 decode floor (~-123 dBm).
+
+---
+
+## Limitation — range is NOT measured
+
+These are indoor results. Indoors, **wall penetration and multipath fades dominate, not distance** — RSSI does not track range (saw -55 dBm and -107 dBm a few steps apart), and the dropouts are fade nulls, not link-budget limits. No outdoor line-of-sight site was available this session.
+
+**The actual range number is still unmeasured.** The old PCB-antenna benchmark (total loss at ~150 m urban, SF7) has not been re-matched. The indoor data confirms the new antennas clearly outperform the PCB antenna (which couldn't even cross the house), but it does **not** establish a max range.
+
+→ Carried forward: outdoor LOS walk at SF7 vs the 150 m benchmark, when a field is available.
+
+---
+
+## Configuration Changes
+
+```cpp
+// TCXO power-up added in begin() (Wio-SX1262 has a TCXO, not an XTAL)
+setDio3AsTcxoCtrl(0x02, 5000);   // 0x02 = 1.8 V, 5 ms startup
+calibrate(0x7F);                 // full recalibration after clock switch
+
+// B2B preset corrected (lora_sx1262.h)
+.reset = 42,   // was 3
+.busy  = 40,   // was 4
+.dio1  = 39    // was 2
+
+// Test SF for antenna comparison (lora-test main.cpp)
+config.spreading_factor = 7;     // was 12
+```
+
+---
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `communication/lora/lora_sx1262.h`   | Fix B2B preset pins (`42/40/39`); fix pinout comment; declare `setDio3AsTcxoCtrl` + `calibrate` |
+| `communication/lora/lora_sx1262.cpp` | Add `setDio3AsTcxoCtrl()` and `calibrate()`; call both in `begin()` |
+| `testing/lora-test/main/main.cpp`    | `spreading_factor` 12 → 7 (test config only) |
+
+---
+
+## Key Takeaways
+
+1. **No TCXO power = dead radio, silently.** The Wio-SX1262 needs the TCXO powered via DIO3. Without it the PLL never locks: TX times out, RX is deaf — but SPI and init "succeed," so it looks healthy at first glance.
+2. **Enabling the TCXO requires a full `Calibrate(0x7F)`** afterward. `CalibrateImage` alone is not enough.
+3. **A wrong BUSY pin throws BUSY timeouts on every command, from boot.** Correct NSS is enough to print the init banner, which is misleading — check the pin line in the banner.
+4. **Bring-up bugs in a shared component are invisible until something uses it.** This driver was broken for *all* `communication/lora` consumers, not just the test app.
+5. **Indoor range testing is meaningless.** Multipath fades and wall loss dominate; RSSI doesn't correlate with distance. A real range number needs outdoor line-of-sight.
+6. **Sender-recovery fix verified in the field** (responder reboot → sender auto-resumed, no reset).
+
+---
+
+## Next Steps
+
+- [x] Fix TCXO + B2B pins; verify ping-pong both directions, 0% loss
+- [x] Confirm sender recovery after responder reboot
+- [x] Commit/push TCXO + pin fix to `communication/lora`
+- [ ] Outdoor LOS range test at SF7 vs the ~150 m PCB benchmark (needs an open field)
+- [ ] Integrate LoRa into the main firmware now that the driver works
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 
