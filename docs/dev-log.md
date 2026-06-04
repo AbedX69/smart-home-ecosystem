@@ -1949,6 +1949,96 @@ config.spreading_factor = 7;     // was 12
 - [ ] Integrate LoRa into the main firmware now that the driver works
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+# Dev Log — Garage Door Controller (bench test)
 
+**Date:** 2026-06-04
+**Target:** ESP32-C6 DevKitC-1
+**Goal:** Prove the controller logic on the bench with low-power hardware (two buzzers) before committing to motor + high-power hardware.
 
+---
+
+## Pin map (bench)
+
+| GPIO | Role | Notes |
+|------|------|-------|
+| 10 | buzzer1 = **POWER** | 1500 Hz, LEDC ch0/timer0 |
+| 11 | buzzer2 = **DIRECTION** | 500 Hz, LEDC ch1/timer1 |
+| 18 | button | active-low, to GND, internal pull-up |
+
+Moved off GPIO 4/5 because those are **strapping pins on the C6** (would tick at boot). Passive buzzers only.
+
+---
+
+## Behavior implemented
+
+**Single-button cycle** (was 2-button, changed this session):
+- press while moving → **STOP**
+- press while stopped-mid → **reverse** (opposite of last direction)
+- press while open → **close**; while closed → **open**
+- first press after boot → opens (UP). No position sensor; ends inferred from travel-time timeout.
+
+Always passes through STOP before reversing — verified safe under spam-clicking.
+
+**Relay model** (what the buzzers stand in for):
+- POWER relay = motor run on/off.
+- DIRECTION relay = OFF→up, ON→down.
+- On DOWN: direction energizes **first**, settle gap, **then** power → direction contact switches with no load.
+- On STOP: power off first, then direction.
+
+---
+
+## Driver / code changes
+
+- **`buzzer.h` / `buzzer.cpp`** — LEDC channel + timer are now constructor args (default ch0/timer0, so old single-buzzer code is unchanged). The stock driver hardcoded channel 0, so two `Buzzer` objects collided and played the same thing on both pins. Now two run independently at different pitches.
+- **`garage_door_device.h/.cpp`** — class is now **state-machine only** (no hardware outputs). The caller maps `state()` → outputs. Removed an earlier over-engineered output abstraction (function callbacks / templates) in favor of this.
+- **`main.cpp`** — owns the two buzzers, maps state→sound, and does the direction-before-power sequencing.
+- Removed stale 2-button doc comment from the header (didn't match the code).
+
+---
+
+## Timing constants (two, different jobs)
+
+- **`DIR_SETTLE_MS`** = 300 ms (in `main.cpp`) — dead-time so the **direction relay contact** switches with no power on it.
+- **`GARAGE_MIN_DWELL_MS`** = 700 ms (in the driver) — after stopping, ignore move-start presses to protect the **motor** from rapid move→stop→reverse hammering. Stopping is never gated. Applies to `cmdToggle` / `cmdUp` / `cmdDown`. Blocked presses log `press ignored (dwell)`.
+
+---
+
+## Build gauntlet (resolved)
+
+The test project compiles components from the shared `components/` tree, which caused a chain of issues:
+
+1. **Missing `partitions_large.csv`** (inherited from main project) → removed custom partition line, set `board_build.flash_size = 2MB`.
+2. **`SPI3_HOST` undeclared** in `addressable_led.cpp` — the C6 only has SPI2. Root cause wasn't the driver; it was that **every** component in `components/` was being compiled.
+3. **CMake scoping** — `EXTRA_COMPONENT_DIRS` pointed at the whole `../../../components` folder. Fixed by pointing it at the **specific** folders needed (`button`, `buzzer`) + the garage module. (Tried `set(COMPONENTS ...)` first — that broke PlatformIO's injected build-info component, error: "Failed to find the default IDF component.")
+4. **Stale `REQUIRES`** — `garage-controller` module still required `relay` (unused now). Fixed to `REQUIRES button driver esp_timer`. (Don't list `esp_log` — global in IDF 5.5.)
+
+Build → flash → runs. Confirmed on hardware.
+
+---
+
+## Test results
+
+- Spam-click test: clean UP↔DOWN alternation, every move separated by STOPPED, no direct UP→DOWN, no double-moves. Debounce (50 ms) holding — fastest real gaps ~180 ms.
+
+---
+
+## Open / next
+
+- **Motor + high-power specs: TBD** (will provide). Then motor-side wiring — DC motor = DPDT direction relay (polarity swap), single-phase AC = run-winding swap; relay contact ratings, fusing, isolation. High-voltage = handle carefully.
+- **Swap buzzers → relays:** buzzer1→power relay, buzzer2→direction relay; `tone()`→`on()`, `stop()`→`off()`; move the DIR_SETTLE sequencing into the relay output path.
+- **Wireless phase:** remote ESP32 → ESP-NOW → device. `cmdUp()`/`cmdDown()`/`stop()` already exist for a remote to call.
+- **Verify flash size:** board def reports 8 MB but one upload detected 2 MB — run `esptool flash_id` to confirm and set the override correctly.
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################

@@ -1,96 +1,76 @@
 /*
- * =============================================================================
- * FILE:        garage_door_device.cpp
- * AUTHOR:      AbedX69
- * CREATED:     2026-05-05
- * VERSION:     1.0.0
- * =============================================================================
+ * garage_door_device.cpp — single-button garage state machine (logic only).
  */
-
 #include "garage_door_device.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 static const char* TAG = "GarageDoor";
 
-
-GarageDoorDevice::GarageDoorDevice(gpio_num_t up_relay_pin,
-                                   gpio_num_t down_relay_pin,
-                                   gpio_num_t up_btn_pin,
-                                   gpio_num_t down_btn_pin,
-                                   bool relay_active_low)
-    : _up_relay(up_relay_pin,   relay_active_low),
-      _down_relay(down_relay_pin, relay_active_low),
-      _up_btn(up_btn_pin),
-      _down_btn(down_btn_pin),
+GarageDoorDevice::GarageDoorDevice(gpio_num_t btn_pin)
+    : _btn(btn_pin),
       _state(GarageState::STOPPED_MID),
-      _move_start_us(0)
+      _move_start_us(0),
+      _rest_since_us(0),
+      _last_dir_up(false)   /* false => first press moves UP (opens) */
 {
 }
 
-GarageDoorDevice::~GarageDoorDevice() {
-    killBothRelays();
-}
-
 bool GarageDoorDevice::init() {
-    ESP_LOGI(TAG, "Initializing garage door device");
-
-    _up_relay.init();
-    _down_relay.init();
-
-    _up_btn.init();
-    _down_btn.init();
-
-    killBothRelays();
-
+    _btn.init();
     _state = GarageState::STOPPED_MID;
     _move_start_us = 0;
-
-    ESP_LOGI(TAG, "Boot state: STOPPED_MID");
+    _rest_since_us = 0;            /* 0 => first press allowed immediately */
+    _last_dir_up = false;
+    ESP_LOGI(TAG, "Boot: STOPPED_MID (first press opens)");
     return true;
 }
 
-
 void GarageDoorDevice::update() {
-    _up_btn.update();
-    _down_btn.update();
-
-    bool up_pressed   = _up_btn.wasPressed();
-    bool down_pressed = _down_btn.wasPressed();
-
-    if (up_pressed)   cmdUp();
-    if (down_pressed) cmdDown();
+    _btn.update();
+    if (_btn.wasPressed()) cmdToggle();
 
     if (isMoving()) {
-        uint64_t now = esp_timer_get_time();
-        uint32_t elapsed_ms = (uint32_t)((now - _move_start_us) / 1000ULL);
-
-        if (elapsed_ms >= GARAGE_TRAVEL_MS) {
+        uint32_t e = (uint32_t)((esp_timer_get_time() - _move_start_us) / 1000ULL);
+        if (e >= GARAGE_TRAVEL_MS) {
             if (_state == GarageState::MOVING_UP) enterIdleOpen();
             else                                  enterIdleClosed();
         }
     }
 }
 
+void GarageDoorDevice::cmdToggle() {
+    switch (_state) {
+        case GarageState::MOVING_UP:
+        case GarageState::MOVING_DOWN:
+            enterStoppedMid();             // stop is always immediate
+            return;
+        case GarageState::STOPPED_MID:
+            if (!dwellElapsed()) { ESP_LOGI(TAG, "press ignored (dwell)"); return; }
+            if (_last_dir_up) enterMovingDown();   // reverse
+            else              enterMovingUp();
+            return;
+        case GarageState::IDLE_OPEN:
+            if (!dwellElapsed()) { ESP_LOGI(TAG, "press ignored (dwell)"); return; }
+            enterMovingDown();
+            return;
+        case GarageState::IDLE_CLOSED:
+            if (!dwellElapsed()) { ESP_LOGI(TAG, "press ignored (dwell)"); return; }
+            enterMovingUp();
+            return;
+    }
+}
 
 void GarageDoorDevice::cmdUp() {
     switch (_state) {
         case GarageState::STOPPED_MID:
         case GarageState::IDLE_CLOSED:
-            ESP_LOGI(TAG, "UP cmd: starting open");
-            enterMovingUp();
-            break;
+            if (!dwellElapsed()) { ESP_LOGI(TAG, "UP ignored (dwell)"); return; }
+            enterMovingUp();   break;
         case GarageState::MOVING_UP:
-        case GarageState::MOVING_DOWN:
-            ESP_LOGI(TAG, "UP cmd while moving: STOP");
-            enterStoppedMid();
-            break;
-        case GarageState::IDLE_OPEN:
-            ESP_LOGI(TAG, "UP cmd ignored: already open");
-            break;
+        case GarageState::MOVING_DOWN:  enterStoppedMid(); break;
+        case GarageState::IDLE_OPEN:    break;             // already open
     }
 }
 
@@ -98,87 +78,46 @@ void GarageDoorDevice::cmdDown() {
     switch (_state) {
         case GarageState::STOPPED_MID:
         case GarageState::IDLE_OPEN:
-            ESP_LOGI(TAG, "DOWN cmd: starting close");
-            enterMovingDown();
-            break;
+            if (!dwellElapsed()) { ESP_LOGI(TAG, "DOWN ignored (dwell)"); return; }
+            enterMovingDown(); break;
         case GarageState::MOVING_UP:
-        case GarageState::MOVING_DOWN:
-            ESP_LOGI(TAG, "DOWN cmd while moving: STOP");
-            enterStoppedMid();
-            break;
-        case GarageState::IDLE_CLOSED:
-            ESP_LOGI(TAG, "DOWN cmd ignored: already closed");
-            break;
+        case GarageState::MOVING_DOWN:  enterStoppedMid(); break;
+        case GarageState::IDLE_CLOSED:  break;             // already closed
     }
 }
 
 void GarageDoorDevice::stop() {
-    if (isMoving()) {
-        ESP_LOGI(TAG, "stop() called");
-        enterStoppedMid();
-    }
+    if (isMoving()) enterStoppedMid();
 }
 
+bool GarageDoorDevice::dwellElapsed() const {
+    uint64_t since_ms = (esp_timer_get_time() - _rest_since_us) / 1000ULL;
+    return since_ms >= GARAGE_MIN_DWELL_MS;
+}
 
 void GarageDoorDevice::enterStoppedMid() {
-    killBothRelays();
-    _state = GarageState::STOPPED_MID;
-    _move_start_us = 0;
-    ESP_LOGI(TAG, "→ STOPPED_MID");
+    _state = GarageState::STOPPED_MID; _move_start_us = 0;
+    _rest_since_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "-> STOPPED_MID");
 }
-
 void GarageDoorDevice::enterMovingUp() {
-    engage(true);
-    _state = GarageState::MOVING_UP;
-    _move_start_us = esp_timer_get_time();
-    ESP_LOGI(TAG, "→ MOVING_UP (timer %u ms)", (unsigned)GARAGE_TRAVEL_MS);
+    _state = GarageState::MOVING_UP; _move_start_us = esp_timer_get_time();
+    _last_dir_up = true;  ESP_LOGI(TAG, "-> MOVING_UP");
 }
-
 void GarageDoorDevice::enterMovingDown() {
-    engage(false);
-    _state = GarageState::MOVING_DOWN;
-    _move_start_us = esp_timer_get_time();
-    ESP_LOGI(TAG, "→ MOVING_DOWN (timer %u ms)", (unsigned)GARAGE_TRAVEL_MS);
+    _state = GarageState::MOVING_DOWN; _move_start_us = esp_timer_get_time();
+    _last_dir_up = false; ESP_LOGI(TAG, "-> MOVING_DOWN");
 }
-
 void GarageDoorDevice::enterIdleOpen() {
-    killBothRelays();
-    _state = GarageState::IDLE_OPEN;
-    _move_start_us = 0;
-    ESP_LOGI(TAG, "→ IDLE_OPEN (travel timeout)");
+    _state = GarageState::IDLE_OPEN; _move_start_us = 0;
+    _rest_since_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "-> IDLE_OPEN");
 }
-
 void GarageDoorDevice::enterIdleClosed() {
-    killBothRelays();
-    _state = GarageState::IDLE_CLOSED;
-    _move_start_us = 0;
-    ESP_LOGI(TAG, "→ IDLE_CLOSED (travel timeout)");
+    _state = GarageState::IDLE_CLOSED; _move_start_us = 0;
+    _rest_since_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "-> IDLE_CLOSED");
 }
-
-
-void GarageDoorDevice::killBothRelays() {
-    _up_relay.off();
-    _down_relay.off();
-}
-
-void GarageDoorDevice::engage(bool up) {
-    /*
-     * Hard interlock:
-     *   1. Both relays OFF.
-     *   2. Block for GARAGE_DIRECTION_DEADTIME_MS so the motor never sees
-     *      opposite phases at the same instant.
-     *   3. Energize only the requested relay.
-     */
-    killBothRelays();
-
-    if (GARAGE_DIRECTION_DEADTIME_MS > 0) {
-        vTaskDelay(pdMS_TO_TICKS(GARAGE_DIRECTION_DEADTIME_MS));
-    }
-
-    if (up) _up_relay.on();
-    else    _down_relay.on();
-}
-
 
 const char* GarageDoorDevice::stateStr() const {
     switch (_state) {
@@ -193,6 +132,5 @@ const char* GarageDoorDevice::stateStr() const {
 
 uint32_t GarageDoorDevice::elapsedMs() const {
     if (!isMoving()) return 0;
-    uint64_t now = esp_timer_get_time();
-    return (uint32_t)((now - _move_start_us) / 1000ULL);
+    return (uint32_t)((esp_timer_get_time() - _move_start_us) / 1000ULL);
 }

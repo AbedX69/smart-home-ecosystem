@@ -197,8 +197,10 @@ struct ToneParams {
  * Just stores the pin number. Hardware setup happens in init().
  * Same pattern as the Button and Encoder components.
  */
-Buzzer::Buzzer(gpio_num_t pin)
+Buzzer::Buzzer(gpio_num_t pin, ledc_channel_t channel, ledc_timer_t timer)
     : pin(pin),
+      channel(channel),
+      timer(timer),
       initialized(false),
       taskHandle(NULL),
       mutex(NULL)
@@ -283,7 +285,7 @@ void Buzzer::init() {
      */
     ledc_timer_config_t timerCfg = {};
     timerCfg.speed_mode      = BUZZER_LEDC_MODE;
-    timerCfg.timer_num       = BUZZER_LEDC_TIMER;
+    timerCfg.timer_num       = timer;
     timerCfg.duty_resolution = BUZZER_DUTY_RESOLUTION;
     timerCfg.freq_hz         = BUZZER_DEFAULT_FREQ_HZ;
     timerCfg.clk_cfg         = LEDC_AUTO_CLK;
@@ -300,8 +302,8 @@ void Buzzer::init() {
      */
     ledc_channel_config_t channelCfg = {};
     channelCfg.speed_mode = BUZZER_LEDC_MODE;
-    channelCfg.channel    = BUZZER_LEDC_CHANNEL;
-    channelCfg.timer_sel  = BUZZER_LEDC_TIMER;
+    channelCfg.channel    = channel;
+    channelCfg.timer_sel  = timer;
     channelCfg.intr_type  = LEDC_INTR_DISABLE;
     channelCfg.gpio_num   = pin;
     channelCfg.duty       = 0;
@@ -379,14 +381,14 @@ uint32_t Buzzer::volumeToDuty(uint8_t volume) {
 void Buzzer::setOutput(uint32_t frequencyHz, uint32_t duty) {
     if (frequencyHz == 0 || duty == 0) {
         /* Silence: zero duty = no PWM output */
-        ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
-        ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+        ledc_set_duty(BUZZER_LEDC_MODE, channel, 0);
+        ledc_update_duty(BUZZER_LEDC_MODE, channel);
         return;
     }
 
-    ledc_set_freq(BUZZER_LEDC_MODE, BUZZER_LEDC_TIMER, frequencyHz);
-    ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, duty);
-    ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+    ledc_set_freq(BUZZER_LEDC_MODE, timer, frequencyHz);
+    ledc_set_duty(BUZZER_LEDC_MODE, channel, duty);
+    ledc_update_duty(BUZZER_LEDC_MODE, channel);
 }
 
 

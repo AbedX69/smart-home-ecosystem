@@ -222,12 +222,18 @@ public:
     /**
      * @brief Construct a new Buzzer instance.
      *
-     * @param pin GPIO pin the buzzer is connected to.
+     * @param pin     GPIO pin the buzzer is connected to.
+     * @param channel LEDC channel to use. Give each Buzzer its OWN channel
+     *                if you want more than one playing at the same time.
+     * @param timer   LEDC timer to use. Own timer per Buzzer = independent
+     *                frequencies. Defaults keep existing single-buzzer code
+     *                working unchanged.
      *
      * @note
      * Does not configure hardware. Call init() first.
      */
-    Buzzer(gpio_num_t pin);
+    Buzzer(gpio_num_t pin, ledc_channel_t channel = LEDC_CHANNEL_0,
+           ledc_timer_t timer = LEDC_TIMER_0);
 
 
     /**
@@ -363,6 +369,8 @@ public:
 private:
 
     gpio_num_t pin;                 // GPIO pin number
+    ledc_channel_t channel;         // LEDC channel (per-instance)
+    ledc_timer_t timer;             // LEDC timer (per-instance)
     bool initialized;               // True after init()
     TaskHandle_t taskHandle;        // Current background sound task
     SemaphoreHandle_t mutex;        // Thread safety mutex
