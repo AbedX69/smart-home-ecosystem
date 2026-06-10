@@ -1,3 +1,4 @@
+#include <sdkconfig.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
@@ -8,8 +9,25 @@
 
 static const char* TAG = "led";
 
-#define LED_PIN     GPIO_NUM_13
-#define NUM_LEDS    10
+// Per-chip config:
+//   ESP32D: GPIO 13 (original '125 wiring). GPIO 6-11 are FLASH pins — never use.
+//   C6:     GPIO 10 — change to whatever you actually wired. 13 = USB D+ on C6.
+//           Avoid 4, 5, 8, 9, 15 (strapping).
+#if CONFIG_IDF_TARGET_ESP32
+#define LED_PIN      GPIO_NUM_13
+#define MEM_SYMBOLS  64
+#elif CONFIG_IDF_TARGET_ESP32S3
+#define LED_PIN      GPIO_NUM_4    // free + non-strapping on both your S3 boards
+#define MEM_SYMBOLS  48
+#elif CONFIG_IDF_TARGET_ESP32C6
+#define LED_PIN      GPIO_NUM_10
+#define MEM_SYMBOLS  48
+#else
+#error "define LED_PIN / MEM_SYMBOLS for this target"
+#endif
+
+#define NUM_LEDS    144
+#define BRIGHTNESS  25   // ~10% of 255
 
 // SK6812 RGBW datasheet timing
 #define T0H_NS  300
@@ -21,7 +39,7 @@ static const char* TAG = "led";
 
 static rmt_channel_handle_t chan;
 static rmt_encoder_handle_t enc;
-static uint8_t buf[NUM_LEDS * 4];  // RGBW, 4 bytes per LED
+static uint8_t buf[NUM_LEDS * 4];  // 4 bytes per LED
 
 typedef struct {
     rmt_encoder_t base;
@@ -45,6 +63,7 @@ static size_t IRAM_ATTR encode_cb(rmt_encoder_t* e, rmt_channel_handle_t ch,
         case 1:
             n += le->copy_enc->encode(le->copy_enc, ch, &le->reset, sizeof(le->reset), &ss);
             if (ss & RMT_ENCODING_COMPLETE) { le->state = 0; *st = RMT_ENCODING_COMPLETE; }
+            if (ss & RMT_ENCODING_MEM_FULL) { *st = RMT_ENCODING_MEM_FULL; }
             break;
     }
     return n;
@@ -61,10 +80,10 @@ static esp_err_t del_cb(rmt_encoder_t* e) {
 }
 
 void fillRGBW(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
-    // RGBW order per datasheet
+    // GRBW on the wire — confirmed empirically (red/green were swapped in RGBW)
     for (int i = 0; i < NUM_LEDS; i++) {
-        buf[i*4+0] = r;
-        buf[i*4+1] = g;
+        buf[i*4+0] = g;
+        buf[i*4+1] = r;
         buf[i*4+2] = b;
         buf[i*4+3] = w;
     }
@@ -74,20 +93,21 @@ void fillRGBW(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
 }
 
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "SK6812 RGBW - RMT on GPIO 13");
+    ESP_LOGI(TAG, "SK6812 RGBW - RMT, GPIO %d, brightness %d/255", LED_PIN, BRIGHTNESS);
 
     rmt_tx_channel_config_t cc = {};
     cc.gpio_num = LED_PIN;
     cc.clk_src = RMT_CLK_SRC_DEFAULT;
     cc.resolution_hz = RMT_HZ;
-    cc.mem_block_symbols = 64;
+    cc.mem_block_symbols = MEM_SYMBOLS;
     cc.trans_queue_depth = 1;
     ESP_ERROR_CHECK(rmt_new_tx_channel(&cc, &chan));
 
-    uint32_t t0h = T0H_NS * RMT_HZ / 1000000000;
-    uint32_t t0l = T0L_NS * RMT_HZ / 1000000000;
-    uint32_t t1h = T1H_NS * RMT_HZ / 1000000000;
-    uint32_t t1l = T1L_NS * RMT_HZ / 1000000000;
+    // 64-bit math: NS * 10MHz overflows 32-bit (300*10^7 = 3e9)
+    uint32_t t0h = (uint64_t)T0H_NS * RMT_HZ / 1000000000ULL;
+    uint32_t t0l = (uint64_t)T0L_NS * RMT_HZ / 1000000000ULL;
+    uint32_t t1h = (uint64_t)T1H_NS * RMT_HZ / 1000000000ULL;
+    uint32_t t1l = (uint64_t)T1L_NS * RMT_HZ / 1000000000ULL;
 
     led_enc_t* le = new led_enc_t();
     le->base.encode = encode_cb;
@@ -106,20 +126,21 @@ extern "C" void app_main(void) {
     rmt_copy_encoder_config_t cpc = {};
     ESP_ERROR_CHECK(rmt_new_copy_encoder(&cpc, &le->copy_enc));
 
-    uint32_t rt = RESET_US * RMT_HZ / 1000000;
+    uint32_t rt = (uint64_t)RESET_US * RMT_HZ / 1000000ULL;
     le->reset.level0 = 0; le->reset.duration0 = rt/2;
     le->reset.level1 = 0; le->reset.duration1 = rt/2;
 
     enc = &le->base;
     ESP_ERROR_CHECK(rmt_enable(chan));
 
+    // Sanity: expect T0H=3 T0L=9 T1H=6 T1L=6
     ESP_LOGI(TAG, "Running. T0H=%lu T0L=%lu T1H=%lu T1L=%lu ticks", t0h, t0l, t1h, t1l);
 
     while (true) {
-        ESP_LOGI(TAG, "RED");    fillRGBW(255,0,0,0);   vTaskDelay(pdMS_TO_TICKS(3000));
-        ESP_LOGI(TAG, "GREEN");  fillRGBW(0,255,0,0);   vTaskDelay(pdMS_TO_TICKS(3000));
-        ESP_LOGI(TAG, "BLUE");   fillRGBW(0,0,255,0);   vTaskDelay(pdMS_TO_TICKS(3000));
-        ESP_LOGI(TAG, "WHITE");  fillRGBW(0,0,0,255);   vTaskDelay(pdMS_TO_TICKS(3000));
-        ESP_LOGI(TAG, "OFF");    fillRGBW(0,0,0,0);     vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGI(TAG, "RED");    fillRGBW(BRIGHTNESS,0,0,0);          vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGI(TAG, "GREEN");  fillRGBW(0,BRIGHTNESS,0,0);          vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGI(TAG, "BLUE");   fillRGBW(0,0,BRIGHTNESS,0);          vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGI(TAG, "WHITE");  fillRGBW(0,0,0,BRIGHTNESS);          vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGI(TAG, "OFF");    fillRGBW(0,0,0,0);                   vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }

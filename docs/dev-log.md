@@ -2030,7 +2030,106 @@ Build → flash → runs. Confirmed on hardware.
 - **Verify flash size:** board def reports 8 MB but one upload detected 2 MB — run `esptool flash_id` to confirm and set the override correctly.
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+# Dev Log — Smart Light (SK6812 RGBW bring-up)
+
+**Dates:** 2026-06-07 (protocol capture) + 2026-06-10 (first ESP32 direct drive)
+**Strip:** SK6812 RGBW, 144 px / 1 m, 4000K
+**Targets:** ESP32D devkit (active) — test app now compiles for ESP32D / S3 / C6
+**Goal:** Prove the ESP32 can drive the strip itself (RMT), using the SP630E + logic analyzer work as the reference.
+
+---
+
+## Session 1 — 06/07: SP630E reference + protocol capture
+
+- SP630E first showed a **repeating 3-LED color pattern** → it defaulted to WS2812B/RGB (3 bytes/px) on a 4-byte/px strip. Fixed: BanlanX app → SK6812/RGBW mode.
+- Logic analyzer (FX2 clone, 24 MHz, PulseView/sigrok, WinUSB via Zadig) on SP630E output: **T1H ≈ 623 ns, T0H ≈ 291 ns** — matches SK6812 datasheet (600/300), validates the SPI backend constants (`0xFC` / `0xE0` @ 8 MHz).
+- SN74HCT125N wiring planned: VCC→5V, GND common, pin 1 (1OE)→GND, pin 2 (1A)←GPIO 13, pin 3 (1Y)→DIN.
+- Power reality: bench supply is 3 A max. Full strip white ≈ 8.6 A @ 5V → protocol work only, low brightness.
+
+---
+
+## Session 2 — 06/10: ESP32 → strip (RMT test app)
+
+### Bench
+
+| What | Value |
+|------|-------|
+| Board | ESP32D devkit |
+| Data | GPIO 13 → strip DIN (**direct**, '125 ended up bypassed — see below) |
+| Power | bench 5V → strip V+, all grounds common |
+| Brightness | 25/255 (~10%) → ~0.3 A one channel lit, safe on 3 A |
+
+### Code fixes before first flash (test `main.cpp`)
+
+1. **32-bit overflow in ns→tick math.** `300 * 10000000` (3e9) overflows int32 → garbage RMT durations. Fixed with `(uint64_t)` cast. Sanity log now prints `T0H=3 T0L=9 T1H=6 T1L=6` ✓.
+2. **Per-target config** via `CONFIG_IDF_TARGET_*`: ESP32D = GPIO 13 / 64 RMT symbols, S3 = GPIO 4 / 48, C6 = GPIO 10 / 48. RMT memory blocks are **48 on S3/C6, 64 on classic ESP32** — 48 on the ESP32D aborts with `mem_block_symbols must be even and at least 64`.
+3. Encoder callback: propagate `RMT_ENCODING_MEM_FULL` in the reset-symbol state (was silently dropped).
+
+### Wrong-board incident (honest section)
+
+Thought the C6 was flashed; boot log said `boot.esp32`, "Multicore app" → it was the **ESP32D**. The mem_block error (#2 above) was the tell. Bonus bullet dodged: the placeholder pin was GPIO 10, which on classic ESP32 is an **internal flash pin (6–11)** — the early abort prevented driving it. Per-target `#if` added so env/board mismatch can't silently half-work again.
+
+### Build gauntlet
+
+- `SPI3_HOST` undeclared compiling `addressable_led.cpp` for C6 (component pulled in via `EXTRA_COMPONENT_DIRS`; C6 has GPSPI2 only). Fix: wrap the SPI3 fallback in `#if SOC_SPI_PERIPH_NUM > 2`. **Verify:** guard was written during the session but the c6 env was never rebuilt after — confirm it's actually in the component before next C6 build.
+
+### The patch bug + analysis
+
+First run **through the '125**: each frame frozen but wrong — strip in patches (LED 1 = X, 2–8 = Y, 9–11 = Z, …), stable until the next transmit. RED frame (`19 00 00 00` repeating) produced: b b w w w b g orange g g b w b w g — **never red**.
+
+Decoded: every observed color is the red frame at a shifted offset —
+
+| Seen | Stream offset |
+|------|---------------|
+| white `00 00 00 19` | +1 byte |
+| blue `00 00 19 00` | +2 bytes |
+| green `00 19 00 00` | +3 bytes |
+| orange | sub-byte bit shift across R+G |
+
+→ bits being **inserted/lost mid-frame**; each break makes downstream LEDs re-sync at a new offset = one patch per break.
+
+- `MEM_SYMBOLS` 64 → 256: no change → **not** an RMT refill underrun.
+- **GPIO 13 direct to DIN (bypassing the '125): clean.** Fault isolated to the shifter path.
+
+### Root cause (working theory) + byte order
+
+- '125 was running with **no series resistor and no decoupling cap** (neither installed yet). Fast 5V HCT edges through breadboard jumpers into an unterminated DIN → ringing/reflections → strip double-clocks → inserted bits. Matches the symptom exactly.
+- Direct 3.3V drive is clean but **out of spec** (SK6812 VIH = 0.7×VDD = 3.5V). Works on this bench with short wire; acceptable for protocol work, not for the final install.
+- Byte order confirmed empirically: **GRBW** (red↔green swapped under RGBW). Matches `AddressableLED`'s documented SK6812_RGBW default. Test app fixed.
+
+### Latent bug found in shared component (not fixed yet)
+
+`addressable_led.cpp` `createEncoder()` has the same overflow pattern with `uint32_t` constants — defined wraparound, but `t0l_ticks` / `t1h_ticks` (900 ns values) compute to **0** → component's **RMT backend is broken** and was never exercised (only the SPI backend was validated vs the SP630E). Fix: `(uint64_t)` cast, same as the test app.
+
+---
+
+## Test results
+
+- Direct GPIO 13, GRBW order, brightness 25: R / G / B / W all correct, stable, 144 px.
+
+## Open / next
+
+- '125 rework: **330–470Ω series resistor at DIN + 100nF across pins 14/7**, then re-test; if still dirty, analyzer on both sides of the chip (CH0 = GPIO 13, CH1 = DIN) and diff against the SP630E capture.
+- Fix `createEncoder()` overflow in the shared component + confirm the `SOC_SPI_PERIPH_NUM` guard landed.
+- Brightness ramp test: ceiling ≈ 85–90/255 all-white on the 3 A supply; full brightness waits for the ~10 A supply.
+- Then: drive the strip from the `AddressableLED` class (RMT backend) instead of the raw test app.
+
+
+
+
+
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################

@@ -60,13 +60,11 @@ static constexpr uint32_t WS2812_RESET_US = 280;
 // RMT resolution (10MHz = 100ns per tick)
 static constexpr uint32_t RMT_RESOLUTION_HZ = 10000000;
 
-// SPI encoding constants
-static constexpr uint8_t SPI_BIT_1 = 0xFC;         // 11111100 — 750ns HIGH, 250ns LOW
-static constexpr uint8_t SPI_BIT_0 = 0xE0;         // 11100000 — 375ns HIGH, 625ns LOW
-static constexpr uint32_t SPI_CLOCK_HZ = 8000000;    ///< 6.4 MHz → ~156ns per SPI bit
-static constexpr size_t SPI_RESET_BYTES = 256;      ///< ~320µs of LOW for reset
-
-
+// SPI encoding — measured against SP630E reference, @ 8 MHz = 125ns/SPI-bit
+static constexpr uint8_t  SPI_BIT_1     = 0xF8;       // 11111000 — 5 high = 625ns HIGH, 375ns LOW
+static constexpr uint8_t  SPI_BIT_0     = 0xC0;       // 11000000 — 2 high = 250ns HIGH, 750ns LOW
+static constexpr uint32_t SPI_CLOCK_HZ  = 8000000;    ///< 8 MHz → 125ns per SPI bit (1µs per LED bit)
+static constexpr size_t   SPI_RESET_BYTES = 256;      ///< 256×8×125ns = 256µs LOW (reset; >80µs ✓)
 /*
  * =============================================================================
  * GAMMA CORRECTION TABLE
@@ -378,9 +376,11 @@ bool AddressableLED::initSpi()
     esp_err_t err = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
 
     if (err == ESP_ERR_INVALID_STATE) {
+#if SOC_SPI_PERIPH_NUM > 2
         // SPI2 already in use, try SPI3
         host = SPI3_HOST;
         err = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
+#endif
     }
 
     if (err != ESP_OK) {
@@ -416,10 +416,10 @@ bool AddressableLED::initSpi()
  */
 bool AddressableLED::createEncoder()
 {
-    uint32_t t0h_ticks = WS2812_T0H_NS * RMT_RESOLUTION_HZ / 1000000000;
-    uint32_t t0l_ticks = WS2812_T0L_NS * RMT_RESOLUTION_HZ / 1000000000;
-    uint32_t t1h_ticks = WS2812_T1H_NS * RMT_RESOLUTION_HZ / 1000000000;
-    uint32_t t1l_ticks = WS2812_T1L_NS * RMT_RESOLUTION_HZ / 1000000000;
+    uint32_t t0h_ticks = (uint64_t)WS2812_T0H_NS * RMT_RESOLUTION_HZ / 1000000000;
+    uint32_t t0l_ticks = (uint64_t)WS2812_T0L_NS * RMT_RESOLUTION_HZ / 1000000000;
+    uint32_t t1h_ticks = (uint64_t)WS2812_T1H_NS * RMT_RESOLUTION_HZ / 1000000000;
+    uint32_t t1l_ticks = (uint64_t)WS2812_T1L_NS * RMT_RESOLUTION_HZ / 1000000000;
 
     led_strip_encoder_t* led_encoder = new led_strip_encoder_t();
     if (!led_encoder) {
@@ -457,7 +457,7 @@ bool AddressableLED::createEncoder()
         return false;
     }
 
-    uint32_t reset_ticks = WS2812_RESET_US * RMT_RESOLUTION_HZ / 1000000;
+    uint32_t reset_ticks = (uint64_t)WS2812_RESET_US * RMT_RESOLUTION_HZ / 1000000;
     led_encoder->reset_code.level0 = 0;
     led_encoder->reset_code.duration0 = reset_ticks / 2;
     led_encoder->reset_code.level1 = 0;
