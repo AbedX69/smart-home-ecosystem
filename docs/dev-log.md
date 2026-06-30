@@ -2125,7 +2125,160 @@ Decoded: every observed color is the red frame at a shifted offset —
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 
 
+# Dev Log — Smart Light Bench Integration
 
+**Date:** 2026-06-30
+**Board:** ESP32-S3 (WROOM dev board), single MCU running both remote UI + device
+**Session goal:** Get the dual-LED bench test driving real SK6812 strips with a clean,
+wireless-ready architecture, then wire and validate the full 2-channel hardware.
+
+---
+
+## Starting state
+
+Three conflicting versions of the test were floating around:
+
+- `dual_led_controller.cpp` — original clean demo, **virtual LEDs only**, slow per-pixel `drawPieSlice`.
+- a half-merged `main.cpp` — broken merge of demo + fast arc renderer. Wouldn't compile:
+  function bodies spliced into each other (`angleInArc`/`getAngle`/`drawArcScanline` interleaved),
+  two `drawArcFast` definitions, duplicate `innerRadius`, duplicate `SPI2_HOST`.
+- `smart_light_device.cpp` v1.0.0 — clean, drives a real strip via `AddressableLED`.
+
+Plus an uploaded `smart_light_remote.{h,cpp}` v1.0.0 that was already clean (view-only) and a
+`gc9a01` driver that had since gained the block-write API + shared-bus support. Discarded the
+broken merge; built on the clean uploads.
+
+---
+
+## Bugs fixed
+
+### Bug 1 — Device init log prints LED count in the GPIO field
+**Problem:** `smart_light_device.cpp` `init()` logged the LED count twice; the `on GPIO %d`
+field received `getNumLeds()` instead of the data pin (device never stored the pin).
+
+```cpp
+// before
+ESP_LOGI(TAG, "Initialized: %d SK6812 RGBW LEDs on GPIO %d",
+         _strip.getNumLeds(), (int)_strip.getNumLeds());
+```
+**Fix:** drop the bogus arg (or store the pin if the GPIO is wanted in the log).
+Cosmetic only — no functional impact. *(Left as a one-liner for application.)*
+
+### Bug 2 — Stale strip-pin comment in `main.cpp`
+**Problem:** header comment claimed strips on **GPIO 1/2**, but the `#define`s used **41/42**.
+GPIO 1/2 would have been a bad choice on S3 regardless. Code was correct; comment was wrong.
+**Fix:** comment corrected to match the 41/42 defines.
+
+### Bug 3 — CMake source list (watch item)
+**Problem:** the component `CMakeLists.txt` only registers `addressable_led.cpp`.
+**Fix:** ensure the app/component CMake lists all sources:
+`gc9a01.cpp`, `touch.cpp`, `encoder.cpp`, `smart_light_remote.cpp`, `smart_light_device.cpp`,
+`addressable_led.cpp`, `main.cpp`.
+
+---
+
+## Change — SmartLightRemote now owns its inputs
+
+**Decision:** `SmartLightRemote` was view-only (state + display ref); `main.cpp` wired touch,
+encoder, and strip around it. Refactored so the remote **owns its encoder + touch + display
+reference + state** and exposes a single `update()`. The **strip stays in `SmartLightDevice`** —
+that is the seam where the wireless split happens (remote = UI MCU, device = strip MCU).
+Putting the strip inside the remote would only have to come back out later.
+
+- New ctor: `SmartLightRemote(display, index, encClk, encDt, encSw, touchPin, activeHigh=true)`
+- `init()` sets up encoder + touch; `update()` polls → updates state → redraws, returns dirty.
+- Arc renderer (`render()` + `drawArcFast` + angle LUT) carried over **byte-for-byte** from v1.0.0.
+- `main.cpp` loop collapsed to `if (panel.update()) syncToDevice(...)` per channel.
+
+Bumped remote to **v1.1.0**.
+
+---
+
+## Hardware config (validated)
+
+| Block | Detail |
+|---|---|
+| Displays ×2 | GC9A01, shared SPI2 — MOSI 11, SCK 12; CS 38/21, DC 39/47, RST 40/48; BLK 3 (disp2 BLK → 3.3V) |
+| Encoders ×2 | CLK/DT/SW = 6/7/15 and 16/17/18, 3.3V |
+| Touch ×2 | TTP223 active-high, OUT = 4 and 5, 3.3V |
+| Strips ×2 | SK6812 RGBW, data = 41 and 42, **NUM_LEDS = 20** (temporary) |
+| Power | one phone charger per strip @ 5V; **common ground** to ESP32 + everything |
+| Level shift | **none** — bare 3.3V data (20-LED short run) |
+| Caps/resistors | **none yet** |
+
+Shared SPI bus confirmed working: GC9A01 `init()` tolerates `ESP_ERR_INVALID_STATE`, so both
+displays share `SPI2_HOST` on common MOSI/SCK with separate CS.
+
+---
+
+## Results
+
+| Test | Result |
+|---|---|
+| Both displays init + render on shared SPI bus | PASS |
+| Both encoders independent (rotate + press) | PASS |
+| Both touch sensors toggle on/off | PASS |
+| Mode cycle BRIGHTNESS → COLOR → WHITE | PASS |
+| Brightness / hue / white adjust + arc redraw | PASS |
+| Remote → device sync drives strips | PASS |
+| Bare 3.3V data integrity @ 20 LEDs | PASS (clean, no glitch) |
+| Overall 2-channel bench | **Works perfectly** |
+
+---
+
+## Verified checklist
+
+- [x] Refactored remote compiles + runs
+- [x] Two self-contained remotes, no pin collisions
+- [x] Shared SPI bus across both displays
+- [x] Two encoders / two touch / two strips all independent
+- [x] Per-loop remote→device sync working
+- [x] Bare data path adequate at 20 LEDs
+- [x] Common ground confirmed (charger GND ↔ ESP32 GND)
+- [ ] GRBW byte order re-verified at full white *(do while at 20 LEDs)*
+- [ ] SN74HCT125N path (pending part + 144-LED scale)
+- [ ] Both-ends injection (pending 144 LEDs)
+
+---
+
+## Files modified
+
+| File | Change |
+|---|---|
+| `smart_light_remote.h` | v1.1.0 — ctor takes encoder + touch pins; `init()`/`update()` added |
+| `smart_light_remote.cpp` | v1.1.0 — input ownership + `update()`; renderer unchanged |
+| `main.cpp` | slimmed to `if (panel.update()) syncToDevice()`; pin comment fixed |
+| `smart_light_device.cpp` | (pending) one-line init-log fix |
+
+---
+
+## Key takeaways
+
+- **Strip belongs to the device, not the remote.** Keeping `AddressableLED` inside
+  `SmartLightDevice` and syncing remote→device each loop is the exact seam for the future
+  wireless hop — no rework needed when it splits across two MCUs.
+- **Shared SPI bus works** once the driver swallows `ESP_ERR_INVALID_STATE` on the 2nd
+  `spi_bus_initialize`. Required for ESP32-C6 later (one usable SPI host).
+- **Bare 3.3V SK6812 data is fine on a short bench run.** At 20 LEDs, no level shifter, no
+  series resistor, no cap — clean. The SN74HCT125N + 330Ω + 1000µF are scale/reliability fixes,
+  not smoke-test blockers.
+- **Never parallel separate supplies into one rail** — neither two chargers on one strip, nor
+  chargers stacked for more amps. One supply per rail; both-ends injection feeds one rail at two
+  points.
+- **Current scales with LED count** — dropping to 20 LEDs (~1.2A full white) made a single 2A
+  charger sufficient and unlocked full-brightness color testing while waiting on the 10A supply.
+
+---
+
+## Next steps
+
+- [ ] Re-verify GRBW byte order at full white (now, at 20 LEDs)
+- [ ] On 10A supply arrival: set `NUM_LEDS` back to **144**
+- [ ] Add SN74HCT125N (2 buffers) + **330Ω** series per data line + **100nF** across chip
+- [ ] Add **1000µF** across each strip 5V/GND; switch to **both-ends injection** on the single 5V rail
+- [ ] NVS-backed dynamic LED count (replace hardcoded `NUM_LEDS`)
+- [ ] Solder permanent build once pin map is frozen
+- [ ] Begin wireless split: move `SmartLightDevice` behind a transport, replace direct `syncToDevice()`
 
 
 

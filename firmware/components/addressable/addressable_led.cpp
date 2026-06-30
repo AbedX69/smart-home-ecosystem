@@ -57,6 +57,12 @@ static constexpr uint32_t WS2812_T1H_NS = 900;
 static constexpr uint32_t WS2812_T1L_NS = 300;
 static constexpr uint32_t WS2812_RESET_US = 280;
 
+// SK6812 timing — datasheet 600/300ns, matches SP630E capture (T1H≈623, T0H≈291)
+static constexpr uint32_t SK6812_T0H_NS = 300;
+static constexpr uint32_t SK6812_T0L_NS = 900;
+static constexpr uint32_t SK6812_T1H_NS = 600;
+static constexpr uint32_t SK6812_T1L_NS = 600;
+
 // RMT resolution (10MHz = 100ns per tick)
 static constexpr uint32_t RMT_RESOLUTION_HZ = 10000000;
 
@@ -141,6 +147,9 @@ static size_t IRAM_ATTR led_strip_encode(rmt_encoder_t* encoder,
             if (session_state & RMT_ENCODING_COMPLETE) {
                 led_encoder->state = 0;
                 *ret_state = RMT_ENCODING_COMPLETE;
+            }
+            if (session_state & RMT_ENCODING_MEM_FULL) {
+                *ret_state = RMT_ENCODING_MEM_FULL;
             }
             break;
     }
@@ -298,7 +307,7 @@ bool AddressableLED::initRmt()
     tx_config.gpio_num = pin;
     tx_config.clk_src = RMT_CLK_SRC_DEFAULT;
     tx_config.resolution_hz = RMT_RESOLUTION_HZ;
-    tx_config.mem_block_symbols = 64;
+    tx_config.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL;  // 64 on ESP32, 48 on S3/C6
     tx_config.trans_queue_depth = 1;
     tx_config.flags.invert_out = false;
     tx_config.flags.with_dma = false;
@@ -416,10 +425,19 @@ bool AddressableLED::initSpi()
  */
 bool AddressableLED::createEncoder()
 {
-    uint32_t t0h_ticks = (uint64_t)WS2812_T0H_NS * RMT_RESOLUTION_HZ / 1000000000;
-    uint32_t t0l_ticks = (uint64_t)WS2812_T0L_NS * RMT_RESOLUTION_HZ / 1000000000;
-    uint32_t t1h_ticks = (uint64_t)WS2812_T1H_NS * RMT_RESOLUTION_HZ / 1000000000;
-    uint32_t t1l_ticks = (uint64_t)WS2812_T1L_NS * RMT_RESOLUTION_HZ / 1000000000;
+    // Pick timing for the actual LED type
+    uint32_t t0h_ns = WS2812_T0H_NS, t0l_ns = WS2812_T0L_NS;
+    uint32_t t1h_ns = WS2812_T1H_NS, t1l_ns = WS2812_T1L_NS;
+    if (ledType == LedType::SK6812_RGBW || ledType == LedType::SK6812_RGBWW) {
+        t0h_ns = SK6812_T0H_NS; t0l_ns = SK6812_T0L_NS;
+        t1h_ns = SK6812_T1H_NS; t1l_ns = SK6812_T1L_NS;
+    }
+
+    // 64-bit math: ns * 10MHz overflows 32-bit (900 * 1e7 wraps -> 0 ticks)
+    uint32_t t0h_ticks = (uint64_t)t0h_ns * RMT_RESOLUTION_HZ / 1000000000ULL;
+    uint32_t t0l_ticks = (uint64_t)t0l_ns * RMT_RESOLUTION_HZ / 1000000000ULL;
+    uint32_t t1h_ticks = (uint64_t)t1h_ns * RMT_RESOLUTION_HZ / 1000000000ULL;
+    uint32_t t1l_ticks = (uint64_t)t1l_ns * RMT_RESOLUTION_HZ / 1000000000ULL;
 
     led_strip_encoder_t* led_encoder = new led_strip_encoder_t();
     if (!led_encoder) {
@@ -457,7 +475,7 @@ bool AddressableLED::createEncoder()
         return false;
     }
 
-    uint32_t reset_ticks = (uint64_t)WS2812_RESET_US * RMT_RESOLUTION_HZ / 1000000;
+    uint32_t reset_ticks = WS2812_RESET_US * RMT_RESOLUTION_HZ / 1000000;
     led_encoder->reset_code.level0 = 0;
     led_encoder->reset_code.duration0 = reset_ticks / 2;
     led_encoder->reset_code.level1 = 0;

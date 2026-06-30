@@ -2,17 +2,17 @@
  * =============================================================================
  * FILE:        smart_light_remote.cpp
  * AUTHOR:      AbedX69
- * CREATED:     2026-05-05
- * VERSION:     1.0.0
+ * VERSION:     1.1.0
  * =============================================================================
  *
- * SmartLightRemote implementation.
+ * Now owns its encoder + touch and drives itself through update().
+ * The arc renderer (render() + drawArcFast + LUT) is unchanged from 1.0.0.
  *
  * Private to this translation unit:
  *   - Angle LUT (one quadrant, mirrored at runtime)
- *   - drawArcFast() — single-window arc renderer with incremental support
+ *   - drawArcFast()        — single-window arc renderer with incremental support
  *   - drawCenteredString() — text-centering helper
- *   - hueToRgb() — HSV→RGB at S=V=full
+ *   - hueToRgb()           — HSV->RGB at S=V=full
  *
  * =============================================================================
  */
@@ -28,10 +28,12 @@ static const char* TAG = "SmartLightRemote";
 
 
 /* =============================================================================
- * Color conversion (hue → RGB at full saturation/value)
+ * File-local helpers
  * ========================================================================== */
 
 namespace {
+
+/* ─── Color conversion (hue -> RGB at full saturation/value) ─────────────── */
 
 void hueToRgb(uint16_t hue, uint8_t& r, uint8_t& g, uint8_t& b) {
     hue = hue % 360;
@@ -52,9 +54,7 @@ void hueToRgb(uint16_t hue, uint8_t& r, uint8_t& g, uint8_t& b) {
 }
 
 
-/* =============================================================================
- * Angle LUT — pre-computed atan2 for one quadrant
- * ========================================================================== */
+/* ─── Angle LUT — pre-computed atan2 for one quadrant ────────────────────── */
 
 constexpr int ARC_MAX_RADIUS = 101;     // outer radius (100) + 1
 static uint8_t s_angleLUT[ARC_MAX_RADIUS][ARC_MAX_RADIUS];
@@ -80,9 +80,7 @@ inline int getAngle(int dx, int dy) {
 }
 
 
-/* =============================================================================
- * drawArcFast — annular arc with incremental support
- * ========================================================================== */
+/* ─── drawArcFast — annular arc with incremental support ─────────────────── */
 
 void drawArcFast(GC9A01& disp, int16_t cx, int16_t cy,
                  int16_t innerR, int16_t outerR,
@@ -168,9 +166,7 @@ void drawArcFast(GC9A01& disp, int16_t cx, int16_t cy,
 }
 
 
-/* =============================================================================
- * drawCenteredString
- * ========================================================================== */
+/* ─── drawCenteredString ─────────────────────────────────────────────────── */
 
 void drawCenteredString(GC9A01& disp, int16_t cy, const char* str,
                         uint16_t color, uint16_t bg, uint8_t size)
@@ -184,7 +180,7 @@ void drawCenteredString(GC9A01& disp, int16_t cy, const char* str,
 
 
 /* =============================================================================
- * SmartLightRemote — public API
+ * One-time setup
  * ========================================================================== */
 
 void SmartLightRemote::buildAngleLUT() {
@@ -205,9 +201,19 @@ void SmartLightRemote::buildAngleLUT() {
 }
 
 
-SmartLightRemote::SmartLightRemote(GC9A01& display, int index)
+/* =============================================================================
+ * Construction / init
+ * ========================================================================== */
+
+SmartLightRemote::SmartLightRemote(GC9A01& display, int index,
+                                   gpio_num_t encClk, gpio_num_t encDt,
+                                   gpio_num_t encSw, gpio_num_t touchPin,
+                                   bool touchActiveHigh)
     : _display(display),
       _index(index),
+      _touch(touchPin, touchActiveHigh),
+      _encoder(encClk, encDt, encSw),
+      _lastEncPos(0),
       _isOn(false),
       _brightness(50),
       _hue(0),
@@ -223,6 +229,57 @@ SmartLightRemote::SmartLightRemote(GC9A01& display, int index)
 {
 }
 
+void SmartLightRemote::init() {
+    _touch.init();
+    _encoder.init();
+    _lastEncPos = _encoder.getPosition();   // avoid a spurious delta on first update()
+}
+
+
+/* =============================================================================
+ * Input poll -> state -> render
+ * ========================================================================== */
+
+bool SmartLightRemote::update() {
+    _touch.update();
+
+    bool dirty = false;
+
+    if (_touch.wasTouched()) {
+        toggle();
+        dirty = true;
+        ESP_LOGI(TAG, "Panel %d: %s", _index + 1, _isOn ? "ON" : "OFF");
+    }
+
+    if (_encoder.wasButtonPressed()) {
+        cycleMode();
+        dirty = true;
+        static const char* names[] = { "BRIGHTNESS", "COLOR", "WHITE" };
+        ESP_LOGI(TAG, "Panel %d mode: %s", _index + 1, names[(int)_mode]);
+    }
+
+    int32_t pos   = _encoder.getPosition();
+    int32_t delta = pos - _lastEncPos;
+    if (delta != 0) {
+        _lastEncPos = pos;
+        if (_isOn) {
+            switch (_mode) {
+                case SmartLightMode::BRIGHTNESS: adjustBrightness(delta);  break;
+                case SmartLightMode::COLOR:      adjustHue(delta * 5);     break;
+                case SmartLightMode::WHITE:      adjustWhite(delta);       break;
+            }
+            dirty = true;
+        }
+    }
+
+    if (dirty) render();
+    return dirty;
+}
+
+
+/* =============================================================================
+ * State mutators
+ * ========================================================================== */
 
 void SmartLightRemote::cycleMode() {
     switch (_mode) {

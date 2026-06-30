@@ -1,45 +1,42 @@
 /**
  * @file main.cpp
- * @brief Bench test for SmartLight: 2 panels + 2 SK6812 RGBW strips, wired.
+ * @brief Bench test: 2 self-contained SmartLightRemote panels + 2 SK6812 strips.
  *
- * Same ESP32-S3 runs both the remote UI (GC9A01 panels) and the device
- * hardware (LED strips). No wireless — state is synced directly in the
- * main loop.
+ * One ESP32-S3 runs both the remote UI (encoder + touch + GC9A01) and the
+ * device hardware (LED strips). No wireless — each loop syncs remote -> device.
  *
- * INPUT MAPPING
- *   Touch tap     → toggle panel on/off
- *   Encoder press → cycle mode: BRIGHTNESS → COLOR → WHITE
- *   Encoder rotate (panel on):
- *       BRIGHTNESS → 0..100
- *       COLOR      → hue, 5° per detent
- *       WHITE      → 0..100
- *   Encoder rotate (panel off): ignored.
+ * Per channel:
+ *   Touch tap     -> toggle on/off
+ *   Encoder press -> cycle mode: BRIGHTNESS -> COLOR -> WHITE
+ *   Encoder turn  -> adjust the active mode value (ignored while off)
  *
  * HARDWARE (ESP32-S3):
- *   Touch 1:    GPIO 4         Touch 2:    GPIO 5
- *   Encoder 1:  CLK=6, DT=7, SW=15
- *   Encoder 2:  CLK=16, DT=17, SW=18
- *   SPI:        MOSI=11, SCK=12
- *   Display 1:  CS=38, DC=39, RST=40, BLK=3
- *   Display 2:  CS=21, DC=47, RST=48
- *   Strip 1:    GPIO 1   (SK6812 RGBW, 144 LEDs)
- *   Strip 2:    GPIO 2   (SK6812 RGBW, 144 LEDs)
+ *   Touch 1:      GPIO 4          Touch 2:    GPIO 5
+ *   Encoder 1:    CLK=6,  DT=7,  SW=15
+ *   Encoder 2:    CLK=16, DT=17, SW=18
+ *   SPI (shared): MOSI=11, SCK=12
+ *   Display 1:    CS=38, DC=39, RST=40, BLK=3
+ *   Display 2:    CS=21, DC=47, RST=48     (shares the bus + backlight)
+ *   Strip 1:      GPIO 41   (SK6812 RGBW, 144 LEDs)
+ *   Strip 2:      GPIO 42   (SK6812 RGBW, 144 LEDs)
+ *
+ * Pins are all defined below — change this block per board (C6/D use lower GPIOs;
+ * 38-48 don't exist there). The classes take pins as args, nothing is hardcoded.
  */
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <driver/gpio.h>
 
 #include "gc9a01.h"
-#include "touch.h"
-#include "encoder.h"
 #include "smart_light_remote.h"
 #include "smart_light_device.h"
 
 static const char* TAG = "test_smart_light";
 
 
-/* ─── Pin map ────────────────────────────────────────────────────────────── */
+/* ─── Pin map (edit per board) ───────────────────────────────────────────── */
 
 #define TOUCH1_PIN   GPIO_NUM_4
 #define TOUCH2_PIN   GPIO_NUM_5
@@ -67,56 +64,11 @@ static const char* TAG = "test_smart_light";
 
 #define STRIP1_PIN   GPIO_NUM_41
 #define STRIP2_PIN   GPIO_NUM_42
-#define NUM_LEDS     144
+#define NUM_LEDS     14
 
 
-/* ─── Per-channel input handler ──────────────────────────────────────────── */
+/* ─── Sync: copy remote panel state -> device strip, then push to HW ─────── */
 
-static bool handleInputs(int idx,
-                         TouchSensor& touch,
-                         RotaryEncoder& enc,
-                         int32_t& lastPos,
-                         SmartLightRemote& panel)
-{
-    bool dirty = false;
-
-    if (touch.wasTouched()) {
-        panel.toggle();
-        dirty = true;
-        ESP_LOGI(TAG, "Panel %d toggled: %s", idx + 1, panel.isOn() ? "ON" : "OFF");
-    }
-
-    if (enc.wasButtonPressed()) {
-        panel.cycleMode();
-        dirty = true;
-        const char* names[] = { "BRIGHTNESS", "COLOR", "WHITE" };
-        ESP_LOGI(TAG, "Panel %d mode: %s", idx + 1, names[(int)panel.mode()]);
-    }
-
-    int32_t pos   = enc.getPosition();
-    int32_t delta = pos - lastPos;
-    if (delta != 0) {
-        lastPos = pos;
-        if (panel.isOn()) {
-            switch (panel.mode()) {
-                case SmartLightMode::BRIGHTNESS: panel.adjustBrightness(delta);  break;
-                case SmartLightMode::COLOR:      panel.adjustHue(delta * 5);     break;
-                case SmartLightMode::WHITE:      panel.adjustWhite(delta);       break;
-            }
-            dirty = true;
-        }
-    }
-
-    return dirty;
-}
-
-
-/**
- * @brief Sync remote panel state → device strip.
- *
- * Copies on/off, brightness, hue, and white from the SmartLightRemote
- * into the SmartLightDevice, then pushes to hardware.
- */
 static void syncToDevice(SmartLightRemote& panel, SmartLightDevice& device) {
     device.setOn(panel.isOn());
     device.setBrightness(panel.brightness());
@@ -131,43 +83,29 @@ static void syncToDevice(SmartLightRemote& panel, SmartLightDevice& device) {
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Smart-light bench test starting (wired)...");
 
-    /* 1. Angle LUT for panel renderer. */
+    /* Angle LUT for the panel renderer. */
     SmartLightRemote::buildAngleLUT();
 
-    /* 2. Displays. */
+    /* Displays — shared SPI2 bus, separate CS. Caller owns the SPI host + init. */
     GC9A01 tft0(SPI_MOSI, SPI_SCK, GC1_CS, GC1_DC, GC1_RST, GC_BLK,      SPI2_HOST);
     GC9A01 tft1(SPI_MOSI, SPI_SCK, GC2_CS, GC2_DC, GC2_RST, GPIO_NUM_NC, SPI2_HOST);
     if (!tft0.init()) ESP_LOGE(TAG, "TFT 0 init failed");
     if (!tft1.init()) ESP_LOGE(TAG, "TFT 1 init failed");
 
-    /* 3. Inputs. */
-    TouchSensor   touch0(TOUCH1_PIN, true);
-    TouchSensor   touch1(TOUCH2_PIN, true);
-    RotaryEncoder enc0(ENC1_CLK, ENC1_DT, ENC1_SW);
-    RotaryEncoder enc1(ENC2_CLK, ENC2_DT, ENC2_SW);
-    touch0.init();
-    touch1.init();
-    enc0.init();
-    enc1.init();
+    /* Remotes — each owns its encoder + touch + display reference + state. */
+    SmartLightRemote panel0(tft0, 0, ENC1_CLK, ENC1_DT, ENC1_SW, TOUCH1_PIN);
+    SmartLightRemote panel1(tft1, 1, ENC2_CLK, ENC2_DT, ENC2_SW, TOUCH2_PIN);
+    panel0.init();
+    panel1.init();
 
-    /* 4. Remote panels (UI). */
-    SmartLightRemote panel0(tft0, 0);
-    SmartLightRemote panel1(tft1, 1);
-
-    /* 5. Device strips (hardware). */
+    /* Devices — the LED strips (device-side hardware). */
     SmartLightDevice strip0(STRIP1_PIN, NUM_LEDS);
     SmartLightDevice strip1(STRIP2_PIN, NUM_LEDS);
-
     if (!strip0.init()) ESP_LOGE(TAG, "Strip 0 init failed");
     if (!strip1.init()) ESP_LOGE(TAG, "Strip 1 init failed");
     ESP_LOGI(TAG, "SK6812 RGBW strips initialized (2x %d LEDs)", NUM_LEDS);
 
-    int32_t lastEnc0 = 0;
-    int32_t lastEnc1 = 0;
-
-    /* 6. Initial paint + sync. */
-    panel0.invalidate();
-    panel1.invalidate();
+    /* Initial paint + sync. */
     panel0.render();
     panel1.render();
     syncToDevice(panel0, strip0);
@@ -176,21 +114,8 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Entering main loop...");
 
     while (true) {
-        touch0.update();
-        touch1.update();
-
-        bool dirty0 = handleInputs(0, touch0, enc0, lastEnc0, panel0);
-        bool dirty1 = handleInputs(1, touch1, enc1, lastEnc1, panel1);
-
-        if (dirty0) {
-            panel0.render();
-            syncToDevice(panel0, strip0);
-        }
-        if (dirty1) {
-            panel1.render();
-            syncToDevice(panel1, strip1);
-        }
-
+        if (panel0.update()) syncToDevice(panel0, strip0);
+        if (panel1.update()) syncToDevice(panel1, strip1);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

@@ -26,7 +26,7 @@ static const char* TAG = "led";
 #error "define LED_PIN / MEM_SYMBOLS for this target"
 #endif
 
-#define NUM_LEDS    144
+#define NUM_LEDS    288
 #define BRIGHTNESS  25   // ~10% of 255
 
 // SK6812 RGBW datasheet timing
