@@ -2284,6 +2284,177 @@ displays share `SPI2_HOST` on common MOSI/SCK with separate CS.
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
+
+
+
+
+# Dev Log — Wireless POC Complete (Hub → ESP-NOW → Strip)
+
+**Date:** 2026-07-10
+**Projects:** `firmware/devices/testing/smart-light-test/hub` (ESP32-S3 WROOM) + `.../strip-node` (Seeed XIAO ESP32-C6)
+**Milestone:** Smart light split into two wireless pieces — POC verified end-to-end.
+
+---
+
+## Bugs
+
+### Bug 1 — `EspNowManager` undeclared identifier (strip node)
+
+**Problem:**
+Build failed with `EspNowManager` undeclared even though the compiler resolved a header. Root cause: `main/main.cpp` line 24 included ESP-IDF's **built-in** raw API header, not the project component:
+
+```cpp
+#include "esp_now.h"          // WRONG — IDF built-in, class never declared
+```
+
+Compiler finds a *valid* header, so no "file not found" — the class simply doesn't exist. Prior session's hypothesis (on-disk file mismatch vs. reviewed version) confirmed.
+
+**Fix:**
+
+```cpp
+#include "esp_now_manager.h"  // component header (pulls in raw esp_now.h itself)
+```
+
+**Result:** Strip node builds clean. Flash 83.3% / RAM 11.3%.
+
+---
+
+### Bug 2 — Hub CMakeLists: wrong path depth + missing component
+
+**Problem:**
+`EXTRA_COMPONENT_DIRS doesn't exist: .../devices/components/addressable`. Hub CMakeLists still had **three** `../` traversals (stale from before projects were nested into `hub/` and `strip-node/` subfolders — same class of bug fixed on the strip node last session). It was also missing the `esp_now` component entirely, which the hub needs as sender.
+
+**Fix:** Mirror the working strip-node CMakeLists (ground truth):
+
+```cmake
+set(EXTRA_COMPONENT_DIRS
+    "../../../../components/addressable"
+    "../../../../components/display/gc9a01"
+    "../../../../components/display/shared"
+    "../../../../components/touch"
+    "../../../../components/encoder"
+    "../../../modules/smart-light"
+    "../../../../wireless/communication/esp_now"
+)
+```
+
+Note: `platformio.ini` `build_flags` were already at the correct depth — only CMakeLists was stale.
+
+---
+
+### Bug 3 — `REQUIRES esp_now_manager` unknown component (hub)
+
+**Problem:**
+`Failed to resolve component 'esp_now_manager' required by component 'main'`. The component's **registered name** is `esp_now` (folder + its own CMakeLists), not the header/file name.
+
+**Fix:** In `hub/main/CMakeLists.txt`: `esp_now_manager` → `esp_now` in REQUIRES.
+
+**Result:** Hub builds and flashes clean.
+
+---
+
+### Bug 4 — Strip renders random per-LED colors (hardware)
+
+**Problem:**
+Wireless state arrived perfectly (log showed correct on/bri/hue/w on every message) but LEDs showed random colors, reshuffling on every received message (~1 s keepalive).
+
+**Diagnosis path:** Payload provably correct → fault in render path. Suspects: (1) WiFi+RMT contention on C6 (no RMT DMA), (2) signal integrity. Added a boot test pattern (solid red 3 s, radio off) to `strip-node/main/main.cpp` as discriminator.
+
+**Actual cause:** Loose **ground wire** on the XIAO C6. No common ground → data line has no voltage reference → every SK6812 frame decodes as garbage, fresh corruption per render (hence the reshuffle-per-message signature).
+
+**Fix:** Reseated ground. Strip renders perfectly.
+
+---
+
+### Bug 5 — Hub display 1 dark (transient)
+
+**Problem:** Display 1 off, its encoder still functional.
+
+**Result:** Resolved on its own; both GC9A01s init successfully in boot log. Most likely same loose-wiring era as Bug 4. **Watch item** — if it recurs, treat as real.
+
+---
+
+## Results
+
+| Test | Result |
+|---|---|
+| Strip node build (c6_seeed) | ✅ SUCCESS — flash 83.3%, RAM 11.3% |
+| Hub build (s3_wroom) | ✅ SUCCESS |
+| Strip node MAC | `B4:3A:45:8A:81:74` (COM7) |
+| Hub MAC | `B8:F8:62:E0:A0:74` (COM4) |
+| Peer add on hub | ✅ `Peer added: B4:3A:45:8A:81:74` |
+| On/off toggle over air | ✅ tracked at strip |
+| Brightness ramp (50→100) | ✅ smooth, every step received |
+| Hue sweep (0→200) | ✅ tracked |
+| White channel (0→52) | ✅ tracked |
+| Render on strip | ✅ clean after ground fix |
+| Both hub displays init | ✅ per boot log |
+
+**Milestone closed: smart light works as two separate pieces over ESP-NOW.**
+
+---
+
+## Verified checklist
+
+- [x] Strip node compiles, flashes, prints MAC
+- [x] Hub compiles with corrected component paths + `esp_now` REQUIRES
+- [x] `STRIP_MAC` set to `{0xB4, 0x3A, 0x45, 0x8A, 0x81, 0x74}`
+- [x] Full state (on, brightness, hue, white) transfers hub → strip
+- [x] Strip renders received state correctly on 10 POC LEDs
+- [x] `pio device list` serial ↔ MAC mapping used to identify COM ports (COM4 = hub, COM7 = strip)
+
+---
+
+## Files modified
+
+| File | Change |
+|---|---|
+| `strip-node/main/main.cpp` | `esp_now.h` → `esp_now_manager.h`; added boot test pattern (diagnostic) |
+| `hub/CMakeLists.txt` | Path depth 3→4 `../`; added `wireless/communication/esp_now` |
+| `hub/main/CMakeLists.txt` | REQUIRES `esp_now_manager` → `esp_now` |
+| `hub/main/main.cpp` | `STRIP_MAC` set to strip node's MAC |
+| `hub/platformio.ini` | Removed `board_build.partitions = partitions_large.csv` from c6 envs |
+
+---
+
+## Key takeaways
+
+1. **A wrong-but-existing include yields "undeclared identifier," not "file not found."** IDF's built-in `esp_now.h` silently shadows the intent to include `esp_now_manager.h`. Name-collision hazard — verify the include *name*, not just that a header resolves.
+2. **CMake REQUIRES uses the registered component name** (`esp_now`), never the header/file name.
+3. **When sibling projects exist, the one that builds is ground truth** — diff its CMakeLists/ini first instead of re-deriving paths.
+4. **Loose/missing common ground = random per-LED colors reshuffling every render.** Data line loses its reference; every frame decodes as garbage. First hardware check for "random colors" from now on: ground continuity.
+5. **Boot test pattern (render before radio init) cleanly discriminates** radio/RMT contention from signal-integrity faults. Cheap, reusable diagnostic.
+6. **`pio device list` hardware serials match MACs** — fastest way to map COM ports to boards in multi-device sessions.
+
+---
+
+## Next steps
+
+- [ ] Remove (or shorten to ~1 s) the boot test pattern in `strip-node/main/main.cpp`
+- [ ] Fix `SmartLightDevice` init log printing wrong GPIO (says 10, actual 18 — wrong variable in log statement)
+- [ ] GC9A01 driver: skip `spi_bus_initialize` when bus already up (currently logs E on second display)
+- [ ] Encoder driver: guard `gpio_install_isr_service` already-installed (benign E on second encoder)
+- [ ] TouchSensor reports `initial state: TOUCHED` at boot on both pads — verify no phantom toggle; consider settling/ignoring initial read
+- [ ] Watch for display 1 dropout recurrence
+- [ ] Confirm 10A fast-blow fuse installed before any full-strip power test
+- [ ] Level-shifter rework: SN74HCT125N + 330–470 Ω series + 100 nF (bench still direct 3.3 V drive, out of spec)
+- [ ] Scale-up plan: 10 → 288 LEDs (requires fuse + level shifter + both-ends injection from single supply)
+- [ ] OTA partition layout — strip node already at 83.3% flash on default table
+- [ ] NVS-backed LED count (replace hardcoded `NUM_LEDS`)
+
+
+
+
+
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
