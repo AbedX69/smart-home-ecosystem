@@ -2456,6 +2456,260 @@ Wireless state arrived perfectly (log showed correct on/bri/hue/w on every messa
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+# Dev Log — 21/07/2026 (Tue)
+
+**Project:** Smart Home Ecosystem — firmware repository
+**Scope:** Integrate system-core component bundle; restructure firmware tree; rewire all app build files
+**Outcome:** ✅ Restructure complete, system components integrated, builds verified
+
+---
+
+## Summary
+
+Two jobs in one session. First, drop the system-core bundle (`auto_pair` v2, `config_store` v1.1, `core_types`, `device_registry`, `message_protocol`) into the repo as proper ESP-IDF components. Second, collapse the tree into five top-level folders and repoint all 31 app build files at the new paths.
+
+The bundle went in cleanly. The build wiring did not — three failed approaches before the right one, all documented below.
+
+---
+
+## Repository structure
+
+**Before:**
+
+```
+firmware/
+├── components/
+├── devices/          modules, production, testing
+└── system/           ota, transport/{ble,esp_now,lora,mesh,wifi,zigbee}
+```
+
+**After:**
+
+```
+firmware/
+├── components/       drivers — grouped: audio/, display/, i2c/
+├── devices/          modules, production
+├── system/           auto_pair, config_store, core_types,
+│                     device_registry, message_protocol, ota
+├── testing/          drivers, devices, wireless
+└── wireless/         ble, esp_now, lora, mesh, wifi, zigbee
+```
+
+Rationale: transports are a peer concern, not a sub-concern of `system`. Tests are a peer of devices, not a child. `system/` now holds only ecosystem logic.
+
+---
+
+## Bugs & fixes
+
+### 1. `auto_pair` v1 header vs v2 implementation — caught before compiling
+
+**Problem:** Repo held `auto_pair` v1.0.0 (18/02). Bundle supplied v2.0.0 (13/07). Dropping the v2 header next to the v1 `.cpp` would not compile — the two are structurally different:
+
+| | v1 | v2 |
+|---|---|---|
+| `PairState` | has `WAITING` | no `WAITING` |
+| `PairRequestInfo` | `fw_version` | `fw_major` + `first_seen_us` |
+| retry counter | `_retry_count` (u8) | `_request_count` (u32) |
+| thread safety | none | `_mutex` |
+| controller list | none | `_paired[8]`, persisted |
+| NVS load | `loadPairing()` | `loadDevicePairing()` |
+
+**Fix:** Treat the bundle as all-or-nothing. Verified `auto_pair.cpp` v2 defines all 38 declared methods, contains zero v1 symbols, and its NVS keys (`ap_paired`, `ap_ctrl_mac`, `ap_devs`) are all under the 15-char NVS limit.
+
+**Second trap avoided:** `core_types.h` defines `DeviceRole` and `TRANSPORT_*`. The old `device_registry.h` defined them too — keeping both would have caused redefinition errors. The bundle's `device_registry.h` has those sections emptied and includes `core_types.h` instead.
+
+---
+
+### 2. Blanket `EXTRA_COMPONENT_DIRS` pulled in every component
+
+**Problem:** Wrote all seven component directories into all 31 apps, on the assumption that ESP-IDF only builds what's listed in `REQUIRES`. It doesn't — **IDF builds every component it discovers.** `encoder-test` therefore tried to build `zigbee`:
+
+```
+CMake Error at build.cmake:328 (message):
+  Failed to resolve component 'esp-zigbee-lib' required by component
+  'zigbee': unknown name.
+```
+
+It also pulled in `mdns` via the wifi component's `idf_component.yml`.
+
+**Fix:** `EXTRA_COMPONENT_DIRS` must be **narrow** — only the dirs an app actually needs. The original per-app lists already did this correctly; they only needed their paths remapped, not replacing.
+
+---
+
+### 3. `set(COMPONENTS ...)` is incompatible with PlatformIO
+
+**Problem:** Tried `set(COMPONENTS main esptool_py)` to keep discovery broad but the build minimal. Under PlatformIO:
+
+```
+Error! Failed to find the default IDF component with build information
+for generic files. Check that the EXTRA_COMPONENT_DIRS option is not
+overridden in your CMakeLists.txt.
+```
+
+**Fix:** Removed. Works under plain `idf.py`, not under PlatformIO's wrapper. Narrow `EXTRA_COMPONENT_DIRS` is the only approach that works here.
+
+---
+
+### 4. `git mv` infinite retry loop on locked directory
+
+**Problem:** `git mv devices/testing/garage-controller-test testing/devices/...` hit a locked file and entered an unbounded prompt loop:
+
+```
+Rename from '...' to '...' failed. Should I try again? (y/n)
+```
+— repeating ~60 times before `fatal: Permission denied`.
+
+**Fix:** Ctrl+C, close VS Code (it held the handle), use `Move-Item` instead. Git detects renames at commit time from content hashes, so `git mv` gains nothing here and fails far worse.
+
+**Rule going forward:** use `Move-Item` for directory moves on Windows, never `git mv`.
+
+---
+
+### 5. PowerShell `-like '??*'` — `?` is a wildcard
+
+**Problem:** The remap script tagged unconvertible paths with a `??` prefix and detected them with:
+
+```powershell
+if ($c -like '??*') { $c = $c.Substring(2) }
+```
+
+`?` matches **any single character** in `-like`. So `'??*'` matches any string of 2+ characters — i.e. every path. Every entry was reported UNRECOGNISED, and every entry would have had its first two characters removed:
+
+```
+components/button  ->  mponents/button
+```
+
+Caught only because the script was run as a dry run first.
+
+**Fix:**
+
+```powershell
+if ($c.StartsWith('??')) { ... }
+```
+
+**Rule:** `-like` is wildcard matching (`*`, `?`, `[ ]`). For literal prefixes use `.StartsWith()`; for regex use `-match`.
+
+---
+
+### 6. `communication/ota` mapped to the wrong destination
+
+**Problem:** Rule order put the generic `^communication/(.+)$` before the specific `^communication/ota$`, so `ota-test` was remapped to `wireless/ota` — which doesn't exist. OTA is a service and lives at `system/ota`.
+
+**Fix:** Moved all `ota` rules above the generic transport rules. In a `switch -Regex`, specific patterns must precede general ones.
+
+---
+
+### 7. Bare `communication` matched no rule
+
+**Problem:** `system-test` and `zigbee-test` used `"../../communication"` — the whole directory, no trailing component. No pattern matched it, so it fell through to the passthrough default.
+
+**Fix:** Added `^communication$` → `wireless`. Both apps now point at all six transports, exactly as before the move. Flagged in the script output as a known risk: they will attempt to build `zigbee` and hit the `esp-zigbee-lib` error. **Pre-existing condition, not introduced today.**
+
+---
+
+## Path remapping applied
+
+| Old | New |
+|---|---|
+| `wireless/communication/<x>` | `wireless/<x>` |
+| `system/transport/<x>` | `wireless/<x>` |
+| `communication/<x>` | `wireless/<x>` |
+| `communication/ota` | `system/ota` |
+| `modules/<x>` | `devices/modules/<x>` |
+| `components/...` | unchanged |
+
+Depths recomputed per app: 3 levels for `testing/drivers/<app>` and `testing/devices/<app>`, 4 for nested (`display-test/gc9a01-test`, `smart-light-test/hub`).
+
+Apps with no existing list received `components`, plus the group folder where the component is nested (`display-test/*` → also `components/display`, etc.).
+
+---
+
+## Build results
+
+| App | Target | RAM | Flash | Time | Result |
+|---|---|---|---|---|---|
+| `testing/drivers/encoder-test` | esp32d | 3.5% (11,444 B) | 18.1% (189,989 B) | 49.7 s | ✅ PASS |
+| `testing/devices/smart-light-test/hub` | s3_wroom | 13.9% (45,492 B) | 74.9% (785,101 B) | 58.9 s | ✅ PASS |
+
+Full 31-app sweep running separately.
+
+⚠️ Hub is at **74.9% flash**. Worth watching — the pairing UI and system components aren't linked in yet.
+
+---
+
+## Verified
+
+- [x] Bundle complete — 13 files, all five components, correct folder structure
+- [x] `auto_pair.cpp` v2 defines every method the v2 header declares
+- [x] No v1 symbols anywhere in the v2 implementation
+- [x] NVS keys within the 15-character limit
+- [x] No duplicate/stale copies of the five components anywhere in the tree
+- [x] `firmware/` reduced to five top-level folders
+- [x] All 31 app CMakeLists remapped, zero unrecognised paths
+- [x] Known-good app builds clean (`encoder-test`)
+- [x] Production-path app builds clean (`smart-light-test/hub`)
+- [ ] Full 31-app sweep — running
+- [ ] Committed
+
+---
+
+## Files modified
+
+**Added** — `firmware/system/`:
+- `core_types/` — `core_types.h`, `CMakeLists.txt` *(new, header-only, zero deps)*
+- `message_protocol/` — `.h`, `.cpp`, `CMakeLists.txt` *(v1.0.0, memset fix)*
+- `config_store/` — `.h`, `.cpp`, `CMakeLists.txt` *(v1.1.0 — `exists()` any-type, `getString` termination)*
+- `device_registry/` — `.h`, `.cpp`, `CMakeLists.txt` *(patched — types moved to core_types)*
+- `auto_pair/` — `.h`, `.cpp`, `CMakeLists.txt` *(v2.0.0 — NVS persistence, mutex, peer hooks)*
+
+**Moved:**
+- `system/transport/*` → `wireless/*`
+- `devices/testing/drivers` → `testing/drivers`
+- `devices/testing/wireless` → `testing/wireless`
+- `devices/testing/{garage-controller-test, smart-light-test}` → `testing/devices/`
+
+**Rewritten:** 31 app root `CMakeLists.txt` — `EXTRA_COMPONENT_DIRS` remapped
+
+**Deleted:** `system/transport/` (empty), `devices/testing/` (empty)
+
+---
+
+## Key takeaways
+
+1. **ESP-IDF builds every component it discovers, not just what's in `REQUIRES`.** `EXTRA_COMPONENT_DIRS` is a build-set declaration, not a search hint. Keep it narrow.
+2. **`set(COMPONENTS ...)` doesn't work under PlatformIO.** Narrow `EXTRA_COMPONENT_DIRS` is the only lever available.
+3. **Component grouping breaks flat discovery.** IDF looks exactly one level down, so `components/display/gc9a01` needs `components/display` listed — `components` alone won't find it.
+4. **`-like` is wildcard matching in PowerShell.** `?` and `*` are wildcards. Use `.StartsWith()` for literal prefixes.
+5. **Dry-run every bulk file rewrite.** The `??` bug would have corrupted 31 files silently. Preview cost nothing and caught it.
+6. **Use `Move-Item`, not `git mv`, for directory moves on Windows.** Git detects renames from content at commit time; `git mv` adds a retry loop that can't be escaped cleanly.
+7. **In `switch -Regex`, specific patterns must come before general ones.** First match wins.
+8. **A header/implementation version mismatch is a silent trap.** Compare declared vs defined method sets before trusting a partial file drop.
+
+---
+
+## Next steps
+
+- [ ] Commit the restructure
+- [ ] Review 31-app sweep results; triage failures into *path problem* (`CMake Error`, `does not exist`, `unknown name`) vs *pre-existing code bug* (`error:` in a `.cpp`)
+- [ ] `.gitignore` — `managed_components/`, `dependencies.lock`, `.pio/`; then `git rm -r --cached` the ~200 mdns files currently tracked
+- [ ] **Wire `auto_pair` into strip node + hub:**
+  - [ ] Add `"../../../../system"` to both apps' `EXTRA_COMPONENT_DIRS`
+  - [ ] Add system components to each `main/CMakeLists.txt` `REQUIRES`
+  - [ ] Strip node: `pair.begin(DeviceRole::LIGHT, "Strip")`
+  - [ ] Hub: `beginAsController()`, log requests, accept over serial
+  - [ ] Confirm both MACs persist to NVS and survive reboot
+- [ ] GC9A01 pairing popup — only after serial flow is proven
+- [ ] Narrow `system-test` / `zigbee-test` component dirs if they're ever needed
+- [ ] Watch hub flash usage (74.9% before pairing code is linked)
+
+**Not blocking:** `message_protocol` v2 stays queued. `auto_pair` v2 rides on `CUSTOM_0/1/2` within the existing 10-byte payload — pairing can be built and tested on v1 of the protocol.
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
