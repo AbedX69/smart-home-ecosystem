@@ -92,9 +92,6 @@ MosfetDriver  mosfet(static_cast<gpio_num_t>(MOSFET_PIN));
 RotaryEncoder encoder(static_cast<gpio_num_t>(ENCODER_CLK),
                       static_cast<gpio_num_t>(ENCODER_DT),
                       static_cast<gpio_num_t>(ENCODER_SW));
-SSD1306       oled(static_cast<gpio_num_t>(I2C_SDA),
-                   static_cast<gpio_num_t>(I2C_SCL),
-                   SSD1306_ADDR);   // I2C display
 
 PCA9548A       i2cMux(static_cast<gpio_num_t>(I2C_SDA), static_cast<gpio_num_t>(I2C_SCL));
 MAX98357       audio(static_cast<gpio_num_t>(MAX98357_DIN), static_cast<gpio_num_t>(MAX98357_BCLK), static_cast<gpio_num_t>(MAX98357_LRC));
@@ -120,6 +117,7 @@ extern "C" void app_main() {
 
     // I2C multiplexer and display
     i2cMux.init();
+    static SSD1306 oled(i2cMux.getBusHandle(), SSD1306_ADDR);   // <- added
     oled.init();
 
     // ------------------------------------------------------------------------

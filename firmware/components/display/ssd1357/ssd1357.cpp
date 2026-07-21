@@ -550,7 +550,7 @@ void SSD1357::fillCircle(int16_t cx, int16_t cy, int16_t radius, uint16_t color)
 uint8_t SSD1357::drawChar(int16_t x, int16_t y, char c, uint16_t color, uint16_t bg, uint8_t size) {
     if (c < 32 || c > 126) c = '?';
     
-    const uint8_t* charData = &font5x7[(c - 32) * 5];
+    const uint8_t* charData = &FONT_5X7[(c - 32) * 5];
     
     for (uint8_t col = 0; col < 5; col++) {
         uint8_t colData = charData[col];

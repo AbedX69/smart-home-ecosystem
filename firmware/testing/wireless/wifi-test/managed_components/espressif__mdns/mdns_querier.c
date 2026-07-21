@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2015-2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2015-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -54,14 +54,41 @@ void mdns_priv_query_results_free(mdns_result_t *results)
 }
 
 /**
- * @brief  Mark search as finished and remove it from search chain
+ * @brief  Check if a search is still in the search_once linked list.
+ *         Must be called with service lock held.
+ */
+static bool search_is_in_list(mdns_search_once_t *search)
+{
+    mdns_search_once_t *s = s_search_once;
+    while (s) {
+        if (s == search) {
+            return true;
+        }
+        s = s->next;
+    }
+    return false;
+}
+
+/**
+ * @brief  Mark search as finished and remove it from search chain.
+ *
+ * Guards against stale pointers: mdns_query_async_delete() may have already
+ * detached and freed this search while an ACTION_SEARCH_END was still queued.
+ * The notifier is cleared before calling to prevent double-invocation if
+ * search_finish() is reached from both mdns_priv_query_done() (max results)
+ * and ACTION_SEARCH_END (timeout) for the same search.
  */
 static void search_finish(mdns_search_once_t *search)
 {
+    if (!search_is_in_list(search)) {
+        return;  /* Already freed by mdns_query_async_delete() */
+    }
     search->state = SEARCH_OFF;
     queueDetach(mdns_search_once_t, s_search_once, search);
     if (search->notifier) {
-        search->notifier(search);
+        mdns_query_notify_t notifier = search->notifier;
+        search->notifier = NULL;
+        notifier(search);
     }
     xSemaphoreGive(search->done_semaphore);
 }
@@ -123,7 +150,13 @@ void mdns_priv_query_action(mdns_action_t *action, mdns_action_subtype_t type)
         return;
     }
     if (type == ACTION_CLEANUP) {
-        search_free(action->data.search_add.search);
+        /* ADD actions hold searches not yet in the list — always safe to free.
+         * SEND/END actions reference searches that may have been removed and
+         * freed by mdns_query_async_delete(). Only free if still in the list. */
+        if (action->type == ACTION_SEARCH_ADD ||
+                search_is_in_list(action->data.search_add.search)) {
+            search_free(action->data.search_add.search);
+        }
     }
 }
 
@@ -157,6 +190,22 @@ void mdns_priv_query_start_stop(void)
         s = s->next;
     }
     mdns_priv_service_unlock();
+}
+
+void mdns_priv_search_once_free(mdns_search_once_t *search)
+{
+    if (!search) {
+        return;
+    }
+    queueDetach(mdns_search_once_t, s_search_once, search);
+    mdns_mem_free(search->instance);
+    mdns_mem_free(search->service);
+    mdns_mem_free(search->proto);
+    vSemaphoreDelete(search->done_semaphore);
+    if (search->result) {
+        mdns_priv_query_results_free(search->result);
+    }
+    mdns_mem_free(search);
 }
 
 void mdns_priv_query_free(void)
@@ -248,8 +297,18 @@ mdns_search_once_t *mdns_priv_query_find_from(mdns_search_once_t *s, mdns_name_t
             return s;
         }
 
-        if (type == MDNS_TYPE_PTR && type == s->type && !strcasecmp(name->service, s->service) && !strcasecmp(name->proto, s->proto)) {
-            return s;
+        if (type == MDNS_TYPE_PTR && type == s->type) {
+            // Multi-label service names (e.g. "_services._dns-sd") are parsed into
+            // host + service fields; reconstruct the compound name for comparison.
+            if (name->host[0] && s->service && strchr(s->service, '.')) {
+                char compound[MDNS_NAME_BUF_LEN * 2];
+                snprintf(compound, sizeof(compound), "%s.%s", name->host, name->service);
+                if (!strcasecmp(compound, s->service) && !strcasecmp(name->proto, s->proto)) {
+                    return s;
+                }
+            } else if (s->service && s->proto && !strcasecmp(name->service, s->service) && !strcasecmp(name->proto, s->proto)) {
+                return s;
+            }
         }
 
         s = s->next;
@@ -288,6 +347,53 @@ static mdns_tx_packet_t *create_search_packet(mdns_search_once_t *search, mdns_i
     q->proto = search->proto;
     q->domain = MDNS_UTILS_DEFAULT_DOMAIN;
     q->own_dynamic_memory = false;
+
+    // Multi-label service names (e.g. "_services._dns-sd") need splitting into
+    // separate DNS labels: host="_services", service="_dns-sd"
+    if (search->service) {
+        char *dot = strchr(search->service, '.');
+        if (dot && dot > search->service) {
+            size_t host_len = dot - search->service;
+            size_t service_len = strlen(dot + 1);
+            if (host_len < MDNS_NAME_BUF_LEN && service_len < MDNS_NAME_BUF_LEN && service_len > 0) {
+                size_t proto_len = search->proto ? strlen(search->proto) : 0;
+                size_t domain_len = strlen(MDNS_UTILS_DEFAULT_DOMAIN);
+                char *host_part = mdns_mem_malloc(host_len + 1);
+                char *service_part = mdns_mem_malloc(service_len + 1);
+                char *proto_part = proto_len > 0 ? mdns_mem_malloc(proto_len + 1) : NULL;
+                char *domain_part = mdns_mem_malloc(domain_len + 1);
+
+                if (!host_part || !service_part || !domain_part || (proto_len && !proto_part)) {
+                    ESP_LOGW(TAG, "Failed to allocate memory for multi-label service query");
+                    mdns_mem_free(host_part);
+                    mdns_mem_free(service_part);
+                    mdns_mem_free(proto_part);
+                    mdns_mem_free(domain_part);
+                    mdns_mem_free(q);
+                    mdns_priv_free_tx_packet(packet);
+                    return NULL;
+                }
+
+                memcpy(host_part, search->service, host_len);
+                host_part[host_len] = '\0';
+                memcpy(service_part, dot + 1, service_len);
+                service_part[service_len] = '\0';
+                if (proto_part) {
+                    memcpy(proto_part, search->proto, proto_len);
+                    proto_part[proto_len] = '\0';
+                }
+                memcpy(domain_part, MDNS_UTILS_DEFAULT_DOMAIN, domain_len);
+                domain_part[domain_len] = '\0';
+
+                q->host = host_part;
+                q->service = service_part;
+                q->proto = proto_part;
+                q->domain = domain_part;
+                q->own_dynamic_memory = true;
+            }
+        }
+    }
+
     queueToEnd(mdns_out_question_t, packet->questions, q);
 
     if (search->type == MDNS_TYPE_PTR) {
@@ -467,8 +573,8 @@ void mdns_priv_query_result_add_txt(mdns_search_once_t *search, mdns_txt_item_t 
         r->next = search->result;
         search->result = r;
         search->num_results++;
+        return;
     }
-    return;
 
 free_txt:
     for (size_t i = 0; i < txt_count; i++) {
@@ -682,11 +788,19 @@ esp_err_t mdns_query_async_delete(mdns_search_once_t *search)
     if (!search) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (search->state != SEARCH_OFF) {
-        return ESP_ERR_INVALID_STATE;
-    }
 
     mdns_priv_service_lock();
+    if (search->state != SEARCH_OFF) {
+        mdns_priv_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Defensively detach from the search list before freeing.
+     * Normally search_finish() already called queueDetach, but in the race
+     * window (timer set SEARCH_OFF, ACTION_SEARCH_END not yet processed)
+     * the search may still be in the list. Without this, search_finish()
+     * or the CLEANUP handler would access freed memory. */
+    queueDetach(mdns_search_once_t, s_search_once, search);
+    search->notifier = NULL;
     search_free(search);
     mdns_priv_service_unlock();
 
@@ -763,7 +877,9 @@ esp_err_t mdns_query_generic(const char *name, const char *service, const char *
 
 esp_err_t mdns_query(const char *name, const char *service_type, const char *proto, uint16_t type, uint32_t timeout, size_t max_results, mdns_result_t **results)
 {
-    return mdns_query_generic(name, service_type, proto, type, type != MDNS_TYPE_PTR, timeout, max_results, results);
+    // PTR queries should be multicast, all other types should be unicast
+    mdns_query_transmission_type_t transmission_type = (type == MDNS_TYPE_PTR) ? MDNS_QUERY_MULTICAST : MDNS_QUERY_UNICAST;
+    return mdns_query_generic(name, service_type, proto, type, transmission_type, timeout, max_results, results);
 }
 
 esp_err_t mdns_query_ptr(const char *service, const char *proto, uint32_t timeout, size_t max_results, mdns_result_t **results)
