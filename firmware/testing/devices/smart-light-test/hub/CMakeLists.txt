@@ -7,6 +7,10 @@ set(EXTRA_COMPONENT_DIRS
     "../../../../components/encoder"
     "../../../../devices/modules/smart-light"
     "../../../../wireless/esp_now"
+    "../../../../system/message_protocol"
+    "../../../../system/auto_pair"
+    "../../../../system/config_store"
+    "../../../../system/core_types"
 )
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(test_smart_light)

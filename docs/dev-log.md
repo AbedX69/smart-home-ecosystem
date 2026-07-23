@@ -2711,6 +2711,322 @@ Full 31-app sweep running separately.
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
+
+# Dev Log — Pairing Validation, TX Policy, and OTA Groundwork
+
+**Date:** Thursday, 23/07/2026
+
+**Goal:** Close out the pairing layer with the two outstanding validation tests, kill the 2-second keepalive spam, then lay OTA groundwork — dual-slot partition tables on both devices, firmware identity reporting, and a staged image on the hub.
+
+---
+
+## Part 1 — Pairing validation
+
+### Test 1: Fresh pair after NVS erase
+
+**Purpose:** Confirm the SOLID_ON fix — removing an 800 ms `vTaskDelay` from the strip's pairing-LED callback — actually killed the ACK retry storm.
+
+**Method:** Full flash erase on the strip, reflash, hub left untouched. The strip was still in the hub's NVS paired list, so this exercised the silent re-accept path — which is the realistic re-flash scenario anyway.
+
+**Result: PASS**
+
+```
+RX CMD PAIR_ACCEPT seq=18103 → TX ACK PAIR_ACCEPT [OK]
+RX CMD SET_LIGHT   seq=18104 → TX ACK SET_LIGHT   [OK]
+```
+
+One ACK per seq. **Zero `TX ACK~` (cached-duplicate) lines** anywhere in the session. Previously this same window produced one real ACK plus two cache replays.
+
+Confirmed for free in the same log:
+
+- NVS erase genuinely took — `Not paired — broadcasting pair requests as "Strip 1"`
+- Encoder + touch path end-to-end, which had never been verified: payload went `00 32 00 00 00` (off) → `01 32 …` (touch on) → brightness sweep `33→45` → hue bytes moving → white `00→18`
+- ~70 consecutive keepalives, every one ACKed first try, zero retries
+
+**On the 14.5-second pairing delay:** seven PAIR_REQ broadcasts before the hub answered. Cause was mundane — the hub wasn't powered on yet when the strip started broadcasting. Not a bug. A genuinely clean fresh pair later in the session took **70 ms** (request at 3790 ms → accepted at 3860 ms).
+
+### Test 2: Hub reboot
+
+**Purpose:** Confirm the hub reloads paired devices from NVS without re-pairing.
+
+**Result: PASS.** The boot banner was lost to USB re-enumeration on reset, but the behaviour is conclusive:
+
+```
+Reconnecting to COM4     Connected!
+I (5609) TX CMD SET_LIGHT seq=44735  A0:74→81:74   ← unicast to strip
+I (5609) RX ACK SET_LIGHT [OK]        81:74→A0:74
+```
+
+Unicasting to `B4:3A:45:8A:81:74` at 5.6 s uptime. That MAC can only have come from NVS. Zero `PAIR REQUEST` / `Auto-accepting` lines. Second reboot identical at 3.5 s. Knobs, mode switching, hue and white all worked immediately afterwards with no pairing exchange.
+
+Later confirmed directly once the banner was caught:
+
+```
+I (1341) AutoPair: Controller mode — 1 paired device(s) loaded from NVS
+I (1351) EspNowManager: Peer added: B4:3A:45:8A:81:74
+```
+
+**Pairing layer is done.** Retry/backoff, RX dedup, cached-ACK replay, and NVS persistence are all verified on hardware from both sides.
+
+---
+
+## Part 2 — Bugs
+
+### 1. Hub blasted an identical SET_LIGHT every 2 seconds
+
+**Problem:** The hub sent the same payload on a fixed 2 s timer regardless of whether anything had changed. Hundreds of identical lines:
+
+```
+TX CMD SET_LIGHT seq=18244  01 38 01 4A 14
+TX CMD SET_LIGHT seq=18245  01 38 01 4A 14
+TX CMD SET_LIGHT seq=18246  01 38 01 4A 14
+```
+
+Two costs: it buries real events in the log, and it will contend with OTA chunk traffic on the same radio.
+
+**Fix:** Send-on-change (already handled by `panel.update()` returning true) plus a 30 s idle heartbeat. Three edits in hub `main/main.cpp`.
+
+```cpp
+#define HEARTBEAT_US      30000000LL    /* 30 s idle heartbeat */
+static int64_t s_last_tx_us[2] = {0, 0};
+```
+
+Stamp inside `sendPanelState` — one line, so every existing call site gets it free:
+
+```cpp
+    MessageProtocol::instance().sendLightState(
+        mac, panel.isOn(), panel.brightness(), panel.hue(),
+        panel.whiteBright(), reliable);
+    s_last_tx_us[panel.index()] = esp_timer_get_time();
+```
+
+Replaced the `static uint8_t ka` block in the 500 ms housekeeping:
+
+```cpp
+            int64_t hb = esp_timer_get_time();
+            if (hb - s_last_tx_us[0] > HEARTBEAT_US) sendPanelState(panel0, false);
+            if (hb - s_last_tx_us[1] > HEARTBEAT_US) sendPanelState(panel1, false);
+```
+
+**Result:** measured `seq=52854 @ 66754 ms` → `seq=52855 @ 96914 ms` = **30,160 ms**. That gap previously held 15 messages. Re-confirmed from a cold boot: main loop entered at 1531 ms, first transmission at 30521 ms.
+
+**Known cost:** the 2 s keepalive was silently covering "strip rebooted, needs refreshing." At 30 s a rebooted strip can sit wrong for up to half a minute. The correct fix is not a faster heartbeat — it's the strip persisting its own state to NVS so it comes back right by itself. Rule #1: device owns state.
+
+### 2. Hub doesn't dedup inbound ACKs — deliberately skipped
+
+Only fires on retries, and there were zero retries across ~1300 messages once bug 1 and the SOLID_ON fix were in. Lives in `message_protocol.cpp`, not `main.cpp`, and amounts to cosmetic log noise. Not worth touching before OTA.
+
+### 3. Latent — unpaired panel never stamps its heartbeat timer
+
+**Problem:** Panel 1 has no light paired to it, so `sendPanelState(panel1, …)` hits the `getLightMac` early return and never reaches the stamp. `s_last_tx_us[1]` stays 0, so the heartbeat condition is true every 500 ms forever.
+
+**Impact:** none visible — no radio traffic, no log lines, and it self-corrects the moment a second strip is paired.
+
+**Fix (not yet applied):** move the stamp above the early return.
+
+### 4. Build failed — partition table doesn't fit in configured flash size
+
+**Problem:**
+
+```
+Partitions tables occupies 16.0MB of flash (16777216 bytes) which does
+not fit in configured flash size 8MB.
+```
+
+`esptool flash_id` reported device ID `0x4018`, and `0x18` = 2^24 = 16 MB. The chip is right; the PlatformIO board definition for `esp32-s3-devkitc-1` claims 8 MB.
+
+**Fix:** `board_upload.flash_size = 16MB` in `platformio.ini`, plus `sdkconfig.defaults`:
+
+```
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+```
+
+Then **delete `sdkconfig.s3_wroom`**. PlatformIO generates that file once and reuses it forever; edits to `sdkconfig.defaults` are ignored until it's removed. This bit twice today.
+
+**Retracted:** `board_upload.maximum_size` was bad advice on my part. PlatformIO derives the app size limit from the partition table itself — overriding it to full flash just makes the usage percentage meaningless.
+
+### 5. Stale `board_build.partitions` in the `[env]` base section
+
+**Problem:** `board_build.partitions = partitions.csv` sat in the shared `[env]` block, so every env inherited a path to a file that no longer existed.
+
+**Fix:** Removed from `[env]`; each board env now names its own table explicitly.
+
+### 6. Version string showed a git hash instead of 0.1.0
+
+**Problem:** Hub reported `FW v9352954-dirty` — ESP-IDF's fallback when `CONFIG_APP_PROJECT_VER` isn't set.
+
+**Fix:** Same cached-sdkconfig trap as bug 4. Deleted `sdkconfig.s3_wroom` again, this time with all four config lines present in `sdkconfig.defaults`.
+
+---
+
+## Part 3 — OTA groundwork
+
+### Partition tables
+
+OTA needs two app slots: the running firmware stays in one while the incoming image downloads into the other, so a failed or broken transfer leaves a working device. The strip had a single ~1 MB slot at 85 % full on a 4 MB chip — three quarters of it unused.
+
+**Design decision — tables keyed by flash size, not by device role.** First attempt named them `hub` and `strip-node`, which bakes in exactly the board coupling we're trying to remove. A partition table doesn't care what a device does, only how much flash the chip has. A 4 MB C6 running strip firmware and a 4 MB C3 running garage firmware use the identical file.
+
+Uniform rule inside each: two equal app slots, remainder becomes `storage`. A controller uses that storage to stage firmware; a leaf node ignores it. No role encoded.
+
+**Location:** `firmware/system/partitions/` — not `devices/`. Per-device placement means each project owns a copy. `system/` is the ecosystem contract layer, and rule #4 ("OTA partitions on every permanent device") is a system-wide rule; `ota_manager` depends on this exact layout. The table is the storage half of the contract, the way `message_protocol` is the wire half.
+
+| File | app0 / app1 | storage | Fits |
+|---|---|---|---|
+| `partitions_4mb.csv` | 1.81 MB each | 320 KB | exact |
+| `partitions_8mb.csv` | 3 MB each | 1.94 MB | exact |
+| `partitions_16mb.csv` | 4 MB each | 7.94 MB | exact |
+
+Each `platformio.ini` env points at the matching table:
+
+```ini
+[env:c6_seeed]
+board_build.partitions = ../../../../system/partitions/partitions_4mb.csv
+
+[env:s3_wroom]
+board_build.partitions = ../../../../system/partitions/partitions_16mb.csv
+board_upload.flash_size = 16MB
+```
+
+### Firmware identity
+
+Added `logFirmwareIdentity()` as the first call in `app_main` on both devices, reading the running partition directly:
+
+```cpp
+static void logFirmwareIdentity(void) {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const esp_app_desc_t*  desc    = esp_app_get_description();
+    ESP_LOGI(TAG, "  FW v%s   built %s %s", desc->version, desc->date, desc->time);
+    ESP_LOGI(TAG, "  Slot: %s @ 0x%06lX  (%lu KB)",
+             running->label,
+             (unsigned long)running->address,
+             (unsigned long)running->size / 1024);
+}
+```
+
+### Staged image
+
+Wrote the strip's firmware into the hub's `storage` partition with esptool. Looks wrong and isn't — a C6 image on an S3, but at `0x810000`, which is typed `data`. The S3 bootloader only executes from `app0`/`app1`, so it's cargo, not code. `--force` needed to get past the chip-mismatch guard.
+
+```powershell
+pio pkg exec -p tool-esptoolpy -- esptool.py --port COM4 --chip esp32s3 `
+  write_flash --force 0x810000 ..\strip-node\.pio\build\c6_seeed\firmware.bin
+```
+
+`logStagedImage()` reads the app descriptor back at offset 32 (24-byte image header + 8-byte first segment header), checks the magic word, and reports the version.
+
+---
+
+## Results
+
+| | Chip | Flash | Table | App slot | Used | Second slot |
+|---|---|---|---|---|---|---|
+| Strip | ESP32-C6FH4 | 4 MB | `partitions_4mb.csv` | 1.81 MB | 47.1 % (895,527 B) | ✅ `app1` |
+| Hub | ESP32-S3 + 8 MB PSRAM | 16 MB | `partitions_16mb.csv` | 4 MB | 19.2 % (803,285 B) | ✅ `app1` |
+
+Strip went from **85 % → 47.1 %** on identical firmware — it was cramped, now it isn't.
+
+Final banners:
+
+```
+I (410) strip_node:   FW v0.1.0   built Jul 23 2026 19:55:02
+I (420) strip_node:   Slot: app0 @ 0x010000  (1856 KB)
+
+I (391) hub:   FW v0.1.0   built Jul 23 2026 20:01:03
+I (391) hub:   Slot: app0 @ 0x010000  (4096 KB)
+I (411) hub: Staged image: "test_smart_light" v0.1.0  built Jul 23 2026 19:55:02
+```
+
+The staged image's build timestamp matches the strip's own banner to the second — the hub is reading the strip's real firmware out of its storage partition.
+
+---
+
+## Verified
+
+- [x] Fresh pair after NVS erase — one ACK per seq, zero cached duplicates
+- [x] SOLID_ON fix confirmed: retry storm gone
+- [x] Encoder + touch + hue + white path end-to-end
+- [x] Hub reboot reloads paired devices from NVS, no re-pairing
+- [x] Knobs work immediately after hub reboot
+- [x] 30 s heartbeat measured at 30,160 ms, and from cold boot
+- [x] Both partition tables applied and confirmed from inside the running firmware
+- [x] Strip app slot = 1,900,544 B = 0x1D0000, matches `partitions_4mb.csv`
+- [x] Hub app slot = 4,194,304 B = 0x400000, matches `partitions_16mb.csv`
+- [x] Firmware version + slot reported on both devices
+- [x] Strip firmware staged on hub and parsed correctly
+- [ ] Committed
+
+---
+
+## Files modified
+
+**Added** — `firmware/system/partitions/`:
+- `partitions_4mb.csv` *(new)*
+- `partitions_8mb.csv` *(new)*
+- `partitions_16mb.csv` *(new)*
+
+**Modified** — `testing/devices/smart-light-test/hub/`:
+- `main/main.cpp` — heartbeat constants + `s_last_tx_us[]`, stamp in `sendPanelState`, replaced 2 s keepalive block, `logFirmwareIdentity()`, `logStagedImage()`, OTA/partition includes
+- `platformio.ini` — removed stale `board_build.partitions` from `[env]`, per-env tables, `board_upload.flash_size = 16MB`
+- `sdkconfig.defaults` — flash size + project version
+
+**Modified** — `testing/devices/smart-light-test/strip-node/`:
+- `main/main.cpp` — `logFirmwareIdentity()`, OTA includes
+- `platformio.ini` — 4 MB table
+- `sdkconfig.defaults` *(new)* — project version
+
+**Deleted:** `sdkconfig.s3_wroom`, `sdkconfig.c6_seeed` (regenerated)
+
+---
+
+## Key takeaways
+
+1. **Partition tables belong to flash size, not to devices.** Keying by role duplicates the file and recreates board coupling. Keying by capacity means a new chip is one line in `platformio.ini`.
+2. **PlatformIO caches the generated `sdkconfig.<env>` and ignores `sdkconfig.defaults` until you delete it.** Cost two round trips today — once on flash size, once on version string. Delete it every time defaults change.
+3. **A board definition's flash size is a claim, not a fact.** `flash_id` device ID `0x4018` = 16 MB. Trust the chip.
+4. **The app-size denominator in the build output is the partition slot.** `used X from 1900544` is proof the table applied — no other value produces that number. Faster than hunting the boot log.
+5. **Writing foreign-architecture firmware into a `data` partition is safe.** The bootloader only executes `app` partitions. `--force` gets past esptool's chip guard.
+6. **A single removed `vTaskDelay` fixed the retry storm.** Blocking inside a protocol callback stalls the RX path long enough for the sender to time out and retry.
+7. **Full erase costs nothing now that pairing is automatic.** Measured re-pair: 70 ms. Erase freely.
+8. **Verify from inside the running firmware, not from the build log.** `esp_ota_get_running_partition()` reports what the device is actually executing.
+
+---
+
+## Next steps
+
+- [ ] Commit
+- [ ] **OTA transfer over ESP-NOW** — the big one:
+  - [ ] Version comparison: strip reports its version, hub decides whether to offer an update
+  - [ ] Chunked transfer with resume (~900 KB over 24-byte payloads)
+  - [ ] Checksum verify before slot flip
+  - [ ] `esp_ota_set_boot_partition` + rollback if the new image doesn't boot
+- [ ] Strip persists its own light state to NVS — closes the 30 s stale window from bug 1
+- [ ] One-line fix for bug 3 (stamp above early return)
+- [ ] BSP layer — pin maps and chip quirks (RMT `mem_block_symbols` 64 on ESP32 vs 48 on C6/S3) are still hard-coded. Partitions were only the first piece of board-agnostic.
+- [ ] Verify flash size on the three unconfirmed boards before trusting their env entries (`esp32dev`, `esp32-c6-devkitc-1`, `seeed_xiao_esp32s3`)
+
+**Cosmetic, logged, untouched:**
+- `SmartLightDevice` logs GPIO 10 in its init message; actual data pin is 18
+- `spi_bus_initialize(809): SPI bus already initialized` on second GC9A01 — expected, shared bus, but logged as an error
+- `gpio_install_isr_service(526): already installed` on the second encoder
+- Both touch sensors report `initial state: TOUCHED` at boot
+
+
+
+
+
+
+
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################

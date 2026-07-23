@@ -1,0 +1,31 @@
+# =============================================================================
+# PARTITION TABLE - 8MB FLASH
+# Any ESP32 variant with 8MB. Any device role.
+# =============================================================================
+#
+# >>> SAVE TO:
+# >>>   C:\Users\AbedX69\embedded-project\firmware\system\partitions\partitions_8mb.csv
+#
+# Verify a board's real flash with:  esptool.py --port COMx flash_id
+#
+# -----------------------------------------------------------------------------
+# LAYOUT  (8MB = 0x800000, fills the chip exactly)
+# -----------------------------------------------------------------------------
+#   0x009000   nvs          16 KB   settings + pairing, survives OTA
+#   0x00D000   otadata       8 KB   which app slot to boot
+#   0x00F000   phy_init      4 KB   RF calibration
+#   0x010000   app0          3 MB   firmware slot A
+#   0x310000   app1          3 MB   firmware slot B
+#   0x610000   storage    1.94 MB   staging area for firmware images
+#
+# 1.94 MB of storage holds roughly two firmware images, so an 8MB
+# board can act as a controller and push updates to leaf nodes.
+# -----------------------------------------------------------------------------
+#
+# Name,     Type, SubType,  Offset,    Size
+nvs,        data, nvs,      0x9000,    0x4000
+otadata,    data, ota,      0xd000,    0x2000
+phy_init,   data, phy,      0xf000,    0x1000
+app0,       app,  ota_0,    0x10000,   0x300000
+app1,       app,  ota_1,    0x310000,  0x300000
+storage,    data, spiffs,   0x610000,  0x1F0000

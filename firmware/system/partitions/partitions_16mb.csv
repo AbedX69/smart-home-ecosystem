@@ -1,0 +1,38 @@
+# =============================================================================
+# PARTITION TABLE - 16MB FLASH
+# Any ESP32 variant with 16MB. Any device role.
+# =============================================================================
+#
+# >>> SAVE TO:
+# >>>   C:\Users\AbedX69\embedded-project\firmware\system\partitions\partitions_16mb.csv
+#
+# Verify a board's real flash with:  esptool.py --port COMx flash_id
+#
+# NOTE: many 16MB modules ship with a PlatformIO board definition that
+# claims 8MB. If the build says "does not fit in configured flash size",
+# that is the config lying, not the chip. Set board_upload.flash_size
+# and CONFIG_ESPTOOLPY_FLASHSIZE_16MB, then delete sdkconfig.<env>.
+#
+# -----------------------------------------------------------------------------
+# LAYOUT  (16MB = 0x1000000, fills the chip exactly)
+# -----------------------------------------------------------------------------
+#   0x009000   nvs          16 KB   settings + pairing, survives OTA
+#   0x00D000   otadata       8 KB   which app slot to boot
+#   0x00F000   phy_init      4 KB   RF calibration
+#   0x010000   app0          4 MB   firmware slot A
+#   0x410000   app1          4 MB   firmware slot B
+#   0x810000   storage    7.94 MB   staging area for firmware images
+#
+# App slots are oversized against a ~1 MB firmware. Deliberate - the
+# chip has 16MB and nothing else needs it. The storage partition is
+# the useful part: it holds firmware for OTHER devices so this board
+# can push updates over the air.
+# -----------------------------------------------------------------------------
+#
+# Name,     Type, SubType,  Offset,    Size
+nvs,        data, nvs,      0x9000,    0x4000
+otadata,    data, ota,      0xd000,    0x2000
+phy_init,   data, phy,      0xf000,    0x1000
+app0,       app,  ota_0,    0x10000,   0x400000
+app1,       app,  ota_1,    0x410000,  0x400000
+storage,    data, spiffs,   0x810000,  0x7F0000

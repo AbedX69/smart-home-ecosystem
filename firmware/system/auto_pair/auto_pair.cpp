@@ -24,9 +24,9 @@ static const char* TAG = "AutoPair";
 /* CmdId aliases — pairing rides on the CUSTOM_* range for now.
  * TODO: promote to dedicated PAIR_* entries in message_protocol.h
  * once the protocol header gets its next version bump. */
-static const CmdId CMD_PAIR_REQUEST = CmdId::CUSTOM_0;
-static const CmdId CMD_PAIR_ACCEPT  = CmdId::CUSTOM_1;
-static const CmdId CMD_PAIR_REJECT  = CmdId::CUSTOM_2;
+static const CmdId CMD_PAIR_REQUEST = CmdId::PAIR_REQUEST;
+static const CmdId CMD_PAIR_ACCEPT  = CmdId::PAIR_ACCEPT;
+static const CmdId CMD_PAIR_REJECT  = CmdId::PAIR_REJECT;
 
 /* NVS keys (max 15 chars) */
 static const char* NVS_DEV_PAIRED   = "ap_paired";      /* bool            */
@@ -81,9 +81,10 @@ void AutoPair::lock() const   { xSemaphoreTake(_mutex, portMAX_DELAY); }
 void AutoPair::unlock() const { xSemaphoreGive(_mutex); }
 
 bool AutoPair::handlesCmd(CmdId cmd) {
-    return cmd == CMD_PAIR_REQUEST ||
-           cmd == CMD_PAIR_ACCEPT  ||
-           cmd == CMD_PAIR_REJECT;
+    return cmd == CmdId::PAIR_REQUEST ||
+           cmd == CmdId::PAIR_ACCEPT  ||
+           cmd == CmdId::PAIR_REJECT  ||
+           cmd == CmdId::PAIR_UNPAIR;   /* reserved, routed but ignored for now */
 }
 
 /* =============================================================================
