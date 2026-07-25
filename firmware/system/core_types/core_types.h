@@ -3,7 +3,8 @@
  * FILE:        core_types.h
  * AUTHOR:      AbedX69
  * CREATED:     2026-07-14
- * VERSION:     1.0.0
+ * MODIFIED:    2026-07-25
+ * VERSION:     1.1.0
  * LICENSE:     MIT
  * PLATFORM:    All ESP32 variants (ESP-IDF v5.x)
  * =============================================================================
@@ -11,8 +12,8 @@
  * Core Types — Shared vocabulary of the entire ecosystem.
  *
  * Every system component (auto_pair, message_protocol, device_registry,
- * scene_engine, ...) speaks in these types. They live here, in a
- * header-only component with ZERO dependencies, so that:
+ * device_identity, scene_engine, ...) speaks in these types. They live here,
+ * in a header-only component with ZERO dependencies, so that:
  *
  *   - auto_pair can know what a DeviceRole is without dragging in the
  *     whole device_registry (heartbeats, timers, device tables)
@@ -21,6 +22,23 @@
  *
  * RULE: nothing in this file may include anything except <cstdint>.
  * If a type needs FreeRTOS, NVS, or a driver — it doesn't belong here.
+ *
+ * =============================================================================
+ * CHANGES IN 1.1.0
+ * =============================================================================
+ *   1. DeviceUid — permanent, transport-independent device identity.
+ *      Replaces MAC as the ecosystem's notion of "who". See device_identity.
+ *   2. HouseId / RoomId / NodeId — logical addressing, so a message can be
+ *      aimed at one device, one room, or a whole installation.
+ *   3. Wildcard + unassigned sentinels for the above.
+ *
+ * WHY UID AND NOT MAC:
+ *   MAC is a property of a radio, not of a device. ESP-NOW has one, LoRa
+ *   does not. Putting MAC in the wire format welds the protocol to one
+ *   transport and breaks ecosystem rule #3 (swappable transport). The UID
+ *   is derived from the factory eFuse MAC, so it is stable across reflash
+ *   and full erase, but it means "this device" rather than "this radio".
+ *   The MAC lives one layer down, in the transport's address table.
  * =============================================================================
  */
 
@@ -32,6 +50,40 @@
 /* ─── Identity ───────────────────────────────────────────────────────────── */
 
 #define DEVICE_NAME_LEN         16      ///< Max device name incl. terminator
+
+/**
+ * @brief Permanent device identity.
+ *
+ * Derived once per boot from the factory eFuse MAC (CRC32). Deterministic:
+ * the same chip always produces the same UID, with no storage involved, so
+ * it survives a full flash erase. See DeviceIdentity::uidFromMac().
+ */
+using DeviceUid = uint32_t;
+
+#define UID_NONE            0x00000000u ///< Sentinel: address by room+node instead
+
+/* ─── Logical Addressing ─────────────────────────────────────────────────── */
+/*
+ * house  — which installation. Yours vs the neighbour's. Prevents two
+ *          separate systems from ever seeing each other's traffic.
+ * room   — which room within the installation.
+ * node   — which device within the room.
+ *
+ * All three are stored in NVS and are changeable at runtime, so a device can
+ * be re-assigned over the air without a reflash. NEVER make these compile-time
+ * constants: a device on a ceiling must be re-addressable without a ladder.
+ */
+
+using HouseId = uint16_t;
+using RoomId  = uint8_t;
+using NodeId  = uint8_t;
+
+#define HOUSE_UNASSIGNED    0x0000      ///< Not commissioned yet — matches any house
+#define ROOM_UNASSIGNED     0x00
+#define NODE_UNASSIGNED     0x00
+
+#define ROOM_ALL            0xFF        ///< Wildcard: every room in the house
+#define NODE_ALL            0xFF        ///< Wildcard: every node in the room
 
 /* ─── Transport Bitmask ──────────────────────────────────────────────────── */
 /* A device advertises which radios it has as an OR of these bits.           */
