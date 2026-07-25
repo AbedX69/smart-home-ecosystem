@@ -25,6 +25,7 @@
 #include "message_protocol.h"
 #include "auto_pair.h"
 #include "config_store.h"
+#include "device_identity.h"
 #include <esp_ota_ops.h>
 #include <esp_app_desc.h>
 #include <esp_partition.h>
@@ -82,14 +83,15 @@ static bool getLightMac(int which, uint8_t out[6]) {
     }
     return false;
 }
-
 static void sendPanelState(const SmartLightRemote& panel, bool reliable) {
+    s_last_tx_us[panel.index()] = esp_timer_get_time();   /* stamp first */
+
     uint8_t mac[6];
     if (!getLightMac(panel.index(), mac)) return;    /* no light paired yet */
+
     MessageProtocol::instance().sendLightState(
         mac, panel.isOn(), panel.brightness(), panel.hue(),
         panel.whiteBright(), reliable);
-    s_last_tx_us[panel.index()] = esp_timer_get_time(); 
 }
 
 
@@ -137,6 +139,9 @@ static void logStagedImage(void) {
 extern "C" void app_main(void) {
     logFirmwareIdentity();
     logStagedImage();
+    DeviceIdentity& id = DeviceIdentity::instance();
+    id.begin();
+    if (!id.isProvisioned()) id.provisionAsNewHouse();
     ESP_LOGI(TAG, "Hub starting (v2 protocol + AutoPair controller)...");
 
     SmartLightRemote::buildAngleLUT();
@@ -204,6 +209,11 @@ extern "C" void app_main(void) {
     panel0.render();
     panel1.render();
 
+    ESP_LOGI(TAG, "══════════════════════════════════════════");
+    ESP_LOGI(TAG, "  UID %s", id.uidString());
+    ESP_LOGI(TAG, "  House 0x%04X  room %u  node %u",
+             (unsigned)id.house(), (unsigned)id.room(), (unsigned)id.node());
+    ESP_LOGI(TAG, "══════════════════════════════════════════");
     ESP_LOGI(TAG, "Entering main loop...");
 
     int64_t  last_change_us[2] = {0, 0};

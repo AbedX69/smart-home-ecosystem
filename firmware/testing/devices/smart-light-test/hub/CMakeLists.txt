@@ -11,6 +11,8 @@ set(EXTRA_COMPONENT_DIRS
     "../../../../system/auto_pair"
     "../../../../system/config_store"
     "../../../../system/core_types"
+    "../../../../system/device_identity"
+
 )
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(test_smart_light)

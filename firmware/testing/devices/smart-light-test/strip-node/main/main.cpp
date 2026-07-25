@@ -18,7 +18,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
-
+#include "device_identity.h"
 #include "smart_light_device.h"
 #include "esp_now_manager.h"
 #include "message_protocol.h"
@@ -167,6 +167,7 @@ static void logFirmwareIdentity(void) {
 
 extern "C" void app_main(void) {
     logFirmwareIdentity();
+    DeviceIdentity::instance().begin();
     ESP_LOGI(TAG, "Strip node starting (v2 protocol, %d LEDs on GPIO %d)...",
              NUM_LEDS, (int)STRIP_PIN);
 
