@@ -3028,6 +3028,269 @@ The staged image's build timestamp matches the strip's own banner to the second 
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+# Dev Log — Repo Hygiene, Roadmap Freeze, and the Identity Layer
+
+**Date:** Saturday, 25/07/2026
+
+**Goal:** Clean the repository of tracked build artifacts, agree a phase order for the rest of the smart light, then lay the first piece of the v3 wire format — a permanent device identity that does not depend on the radio.
+
+---
+
+## Part 1 — Roadmap
+
+The old task list had grown by accretion and put the strip on the ceiling before OTA existed. Re-ordered around a single constraint: **anything hard to change later must be frozen before the strip goes up.**
+
+| Phase | Work | Why here |
+|---|---|---|
+| 0 | Repo hygiene | Trivial, blocks nothing, do it first |
+| 1 | Freeze v3 wire format — UIDs + house/room/node | Pairing UI renders identity; multi-hub tests need addressing |
+| 2 | Make the strip un-brickable — OTA over ESP-NOW | Gate for everything physical |
+| 3 | Power at real load — level shifter, 10 → 144 LEDs | Needs Phase 2 done first, in case firmware must change |
+| 4 | Hub hardware + UI — ST7789V2 + GC9A01, pairing UI, BSP | Builds on frozen identity |
+| 5 | Solder, enclosure, install | **END OF PHASE 5 = HARDWARE FREEZE** |
+| 6 | Multi-device interference + addressing | |
+| 7 | Garage controller | |
+
+**Two moves from the original ordering.** UIDs came forward from near-last to Phase 1: the pairing UI displays device identity, so building it on MAC means rebuilding it afterwards, and the multi-device test is meaningless without addressing. Hanging the strip went from step 3 to Phase 5, behind a working rollback test.
+
+**Standalone operation — resolved.** Initial instinct was that a strip with a dead hub is meaningless because the hub is the switch. Wrong: the strip has its own 5V PSU and the hub is only a *logical* switch, so the strip stays lit with the hub off. The real question is what happens when the *strip* power-cycles. Decision: persist last state in NVS plus a `power_on_behavior` byte (last / off / on), defaulting to last-state, with NVS writes debounced ~10 s to protect flash endurance during encoder sweeps.
+
+**Factory reset — no wall switch exists.** The strip wires directly to mains, so power-cycle-count reset is not available. Instead: if the strip has not heard from its paired hub in ~10 minutes it re-opens for pairing while staying lit. Self-healing, no hardware. A button inside the enclosure gets added anyway as insurance.
+
+---
+
+## Part 2 — Repo hygiene
+
+**Problem:** the repository tracked 1,144 files. 846 of them were not source.
+
+| Files | What |
+|---|---|
+| 771 | `managed_components/espressif__mdns` — auto-downloaded by ESP-IDF, committed into 7 test projects |
+| 73 | generated `sdkconfig.<env>` |
+| 2 | `dependencies.lock` |
+| **298** | **actual project files** |
+
+The `sdkconfig.<env>` entries are the ones that actually cost time: PlatformIO regenerates them and then ignores `sdkconfig.defaults` until they are deleted. That trap burned two round trips on 23/07 (flash size, then version string). Tracked in git, a fresh clone would start pre-poisoned with a stale config and the same bug would be rediscovered with no reason to suspect it.
+
+**Fix:**
+
+```gitignore
+managed_components/
+dependencies.lock
+sdkconfig.*
+!sdkconfig.defaults
+```
+
+The negation matters — `sdkconfig.defaults` is source, `sdkconfig.s3_wroom` is output.
+
+```powershell
+git rm -r --cached -q .
+git add .
+git commit -m "chore: untrack managed_components and generated sdkconfig"
+```
+
+**Result:** 846 deletions, verified against a tree dump before committing (predicted 846, `git status` showed 847 — the extra line being `.gitignore` itself as modified). 7 `sdkconfig.defaults` survived, all of them real; the other 28 were Espressif's own example configs inside the vendored library. `managed_components` tracked count: 0.
+
+Push wrote 42 objects totalling 2.94 KiB — deletions only create tree objects, never blobs.
+
+---
+
+## Part 3 — Wire format design (frozen, not yet implemented)
+
+The v2 packet carries `src_mac[6]` and `dst_mac[6]`. On ESP-NOW those 12 bytes duplicate what the radio already does; on LoRa they are meaningless. MAC in the wire format welds the protocol to one transport, which breaks ecosystem rule #3.
+
+**Reclaiming those 12 bytes pays for the entire addressing scheme with zero size change:**
+
+| Field | Bytes | |
+|---|---|---|
+| `magic` `proto_ver` `msg_type` `cmd_id` `flags` `seq` | 10 | unchanged |
+| ~~`src_mac[6]` `dst_mac[6]`~~ | ~~12~~ | **removed** |
+| `house_id` | 2 | new |
+| `src_uid` | 4 | new |
+| `dst_uid` | 4 | new |
+| `dst_room` `dst_node` | 2 | new |
+| `payload_len` `status` | 2 | unchanged |
+| **header** | **24** | identical to v2 |
+
+Packet stays 48 bytes. Reliability, dedup, and retry logic are untouched — they key off `seq`, not addressing.
+
+**Addressing:** `dst_uid != 0` is unicast; `dst_uid == 0` falls through to `dst_room`/`dst_node` with `0xFF` as wildcard at either level. `house_id` mismatch drops at the top of `processMessage`, which makes two neighbouring installations mutually invisible — Phase 6's interference problem solved as a side effect. `HOUSE_UNASSIGNED` (0) matches everything in both directions so a factory-fresh device can still complete pairing.
+
+**MAC does not disappear, it moves down** into the transport as a `uid → MAC` table, populated from the paired list. LoRa later swaps the table, not the format.
+
+**room/node live in NVS, never in `#define`.** Compile-time constants would mean reflashing a ceiling-mounted device to change which room it is in. `SET_IDENTITY` is reserved in the CmdId map now; the app or main controller fills it in over the air later.
+
+---
+
+## Part 4 — Bugs
+
+### 1. `esp_efuse_mac_get_default()` returns a truncated EUI-64 on the C6
+
+**Problem:** the strip reported a UID derived from `B4:3A:45:FF:FE:8A` while its actual MAC is `B4:3A:45:8A:81:74`.
+
+The C6 stores its address in eFuse as 8 bytes in EUI-64 form — the real MAC with `FF:FE` inserted after the OUI, giving `B4:3A:45:FF:FE:8A:81:74`. Reading "the first 6 bytes" returns the prefix and discards `81:74`, which is the only genuinely unique part.
+
+**Severity:** of the 6 bytes being hashed, `B4:3A:45` is Espressif's OUI (identical on every chip they ship) and `FF:FE` is constant padding. **One byte varies — 256 possible UIDs.** At ~20 devices that is a better-than-even chance of a collision, and a UID collision means two nodes answering to one address.
+
+**Fix:**
+
+```cpp
+esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
+```
+
+`ESP_MAC_BASE` is the address every interface derives from, correctly collapsed back to EUI-48. Still read from eFuse, so still erase-proof. Preferred over `ESP_MAC_WIFI_STA` because the garage node on LoRa may never bring up WiFi.
+
+**Verified:** hub reported `UID FEBDCDC3`; `CRC32(B8:F8:62:E0:A0:74)` computed independently = `FEBDCDC3`. Exact match. The old broken value `4E086A08` also reproduces exactly as `CRC32(B4:3A:45:FF:FE:8A)`, confirming the diagnosis rather than guessing at it.
+
+### 2. Unpaired panel never stamps its heartbeat timer (carried from 23/07)
+
+**Problem:** `sendPanelState()` hit the `getLightMac()` early return before reaching the timestamp, so `s_last_tx_us[1]` stayed 0 and the heartbeat condition was true every 500 ms forever.
+
+**Fix:** stamp first, then return.
+
+```cpp
+static void sendPanelState(const SmartLightRemote& panel, bool reliable) {
+    s_last_tx_us[panel.index()] = esp_timer_get_time();   /* stamp first */
+
+    uint8_t mac[6];
+    if (!getLightMac(panel.index(), mac)) return;
+    ...
+}
+```
+
+### 3. Two dead `-I` paths in every `platformio.ini`
+
+**Problem:** `-I../../../../wireless/communication/esp_now` — there is no `communication/` level. `-I../../../modules/smart-light` resolves to `testing/modules/smart-light`, which does not exist.
+
+**Impact:** none on the build. ESP-IDF supplies real include paths through `REQUIRES`; these flags only feed IntelliSense, which is why VS Code has been showing red squiggles on headers that compile fine.
+
+**Status:** logged, not yet fixed.
+
+### 4. Boot output lost to USB CDC enumeration
+
+**Not a firmware bug**, but it cost most of the session. `pio run -t upload -t monitor` prints `Hard resetting via RTS pin...` *before* the monitor attaches, so the first ~1.2 s on the S3 and ~3.5 s on the C6 is unrecoverable. Splitting upload and monitor into two commands does not help — the port is still enumerating.
+
+Symptom is distinctive: the log opens mid-line, e.g. `segment 0: paddr=00010020 vaddr=420a0020 size=I (3520) EspNowManager:`.
+
+**Workaround:** log identity late, after a known-visible line, rather than in the first milliseconds. Blunt alternative for genuinely early output is a `vTaskDelay(1500)` at the top of `app_main` — debugging only.
+
+### 5. `SmartLightDevice` logs the LED count in the GPIO slot
+
+```
+I (513) SmartLightDevice: Initialized: 10 SK6812 RGBW LEDs on GPIO 10
+```
+
+Previously logged as "wrong GPIO". It is worse than that — `getNumLeds()` is passed twice, and both values happening to be 10 hid it. **Status:** open.
+
+---
+
+## Part 5 — `device_identity`
+
+New component at `firmware/system/device_identity/`. Two deliberately separate ideas:
+
+- **UID** — permanent, derived, never configured. `CRC32(eFuse base MAC)`.
+- **house / room / node** — assigned, stored in NVS, changeable at runtime and therefore over the air.
+
+**Why derived and not generated:** the obvious design is `esp_random()` on first boot saved to NVS. During development a full erase happens constantly, and after each one the device would invent a new identity — its own hub would see a stranger and every paired relationship would silently break.
+
+**Why 4 bytes:** 2 bytes gives ~7% collision probability across 100 devices. 4 bytes is free anyway, since the header lands on exactly 24 either way.
+
+`UID_NONE` (0) is the "address by room+node" sentinel, so `uidFromMac()` bumps a hashed 0 to 1. Odds are 1 in 4.3 billion; a silent address collision would be miserable to debug.
+
+---
+
+## Results
+
+| | Reported | Independently computed | Match |
+|---|---|---|---|
+| Hub UID | `FEBDCDC3` | `CRC32(B8:F8:62:E0:A0:74)` = `FEBDCDC3` | ✅ |
+| Hub house | `0x2B6C` | minted once, persisted | ✅ |
+| Strip UID (old, broken) | `4E086A08` | `CRC32(B4:3A:45:FF:FE:8A)` = `4E086A08` | ✅ diagnosis confirmed |
+| Strip UID (expected) | — | `CRC32(B4:3A:45:8A:81:74)` = `EE907A91` | ⏳ pending |
+
+Image growth from linking `device_identity`: hub 803,285 → 805,568 B, strip 895,527 → 897,280 B.
+
+**Erase test, strip:** `failed to load RF calibration data (0x1102)` confirms a genuinely blank flash. Re-pair took **30 ms** (`Not paired` at 3820 ms → `PAIRED` at 3850 ms), with the hub logging `Known device re-requesting — auto re-accepting` from its own surviving NVS entry.
+
+---
+
+## Verified
+
+- [x] 846 non-source files untracked, predicted count matched actual
+- [x] `sdkconfig.defaults` survived (7, all real); `managed_components` tracked count 0
+- [x] Pushed clean — 42 objects, 2.94 KiB
+- [x] `device_identity` compiles and links into both devices
+- [x] Hub UID matches independently computed CRC32 of its real MAC
+- [x] Hub house id minted once and stable across reboots
+- [x] EUI-64 truncation bug diagnosed and reproduced numerically, not guessed
+- [x] Strip survives full erase and re-pairs in 30 ms
+- [ ] **Strip UID confirmed as `EE907A91` after the `ESP_MAC_BASE` fix**
+- [ ] Strip UID confirmed identical across a full erase
+- [ ] This session committed
+
+---
+
+## Files modified
+
+**Added** — `firmware/system/device_identity/`:
+- `device_identity.h` *(new)*
+- `device_identity.cpp` *(new)*
+- `CMakeLists.txt` *(new)*
+
+**Modified** — `firmware/system/core_types/`:
+- `core_types.h` — v1.0.0 → v1.1.0; `DeviceUid`, `HouseId`/`RoomId`/`NodeId`, wildcard and unassigned sentinels
+
+**Modified** — `firmware/testing/devices/smart-light-test/hub/`:
+- `main/main.cpp` — `device_identity.h`, `id.begin()`, first-boot house provisioning, late identity banner, bug 2 fix
+- `main/CMakeLists.txt` — `device_identity` in `REQUIRES`
+- `CMakeLists.txt` — `device_identity` in `EXTRA_COMPONENT_DIRS`
+- `platformio.ini` — `-I` for `device_identity`
+
+**Modified** — `firmware/testing/devices/smart-light-test/strip-node/`:
+- `main/main.cpp` — `device_identity.h`, `DeviceIdentity::instance().begin()`, late identity banner
+- `main/CMakeLists.txt`, `CMakeLists.txt`, `platformio.ini` — as above
+
+**Modified** — root:
+- `.gitignore` — `managed_components/`, `dependencies.lock`, `sdkconfig.*`, `!sdkconfig.defaults`
+
+---
+
+## Key takeaways
+
+1. **`esp_efuse_mac_get_default()` is not portable across ESP32 variants.** On the C6 it hands back a truncated EUI-64 whose varying part has been cut off. Use `esp_read_mac(mac, ESP_MAC_BASE)`.
+2. **Verify derived identifiers against an independent computation.** Reading `UID FEBDCDC3` in a log proves nothing. Computing `CRC32` of the MAC separately and getting the same value proves the input was right — and recomputing the *old broken* value confirmed the diagnosis instead of leaving it a plausible story.
+3. **A UID's entropy is the entropy of its input, not its width.** A 32-bit hash of a 6-byte buffer with 5 constant bytes has 256 possible outputs.
+4. **`git rm -r --cached .` then `git add .` re-applies `.gitignore` across the whole tree in one shot.** Predict the deletion count first and compare before committing.
+5. **`sdkconfig.defaults` is source; `sdkconfig.<env>` is output.** The `!` negation line is what keeps the distinction.
+6. **USB CDC enumeration eats early boot logs and no monitor timing fixes it.** Log identity after a line you can already see.
+7. **Compile-time device configuration is a trap for anything that gets installed.** A `#define ROOM_ID` means a ladder. NVS plus a reserved wire-format command costs the same today and nothing later.
+8. **Build duration is a staleness signal.** A 7.7 s build where previous ones took 9–18 s means nothing recompiled — usually an unsaved file.
+
+---
+
+## Next steps
+
+- [ ] Confirm strip `UID EE907A91`, then re-run the erase test and confirm it is unchanged
+- [ ] **Phase 1 remainder — `message_protocol` v3:**
+  - [ ] New 24-byte header: drop `src_mac`/`dst_mac`, add `house_id` / `src_uid` / `dst_uid` / `dst_room` / `dst_node`
+  - [ ] `uid → MAC` table in `esp_now_manager`, populated from the paired list
+  - [ ] `auto_pair` exchanges UIDs and pushes `house_id` to the joining node
+  - [ ] Callback signatures: `const uint8_t src_mac[6]` → `DeviceUid src_uid`
+  - [ ] Reserve `SET_IDENTITY` / `GET_IDENTITY` / `REPORT_IDENTITY` at 0x74–0x76
+- [ ] Change `storage` partition subtype from `spiffs` to `undefined` in all three tables, so nothing can format the staged image
+- [ ] Strip persists light state to NVS + `power_on_behavior` byte, writes debounced ~10 s
+
+**Cosmetic, logged, untouched:**
+- `SmartLightDevice` logs `getNumLeds()` in the GPIO slot (bug 5)
+- Dead `-I` paths in both `platformio.ini` files (bug 3)
+- `spi_bus_initialize(809): SPI bus already initialized` on second GC9A01
+- `gpio_install_isr_service(526): already installed` on second encoder
+- Both touch sensors report `initial state: TOUCHED` at boot
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
