@@ -9,3 +9,8 @@ __pycache__/
 .DS_Store
 Thumbs.db
 youtube-recordings/
+# generated / downloaded - never commit
+managed_components/
+dependencies.lock
+sdkconfig.*
+!sdkconfig.defaults
