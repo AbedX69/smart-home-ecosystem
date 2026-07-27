@@ -808,6 +808,7 @@ bool AddressableLED::isGammaCorrectionEnabled() const { return gammaEnabled; }
  * =============================================================================
  */
 uint16_t AddressableLED::getNumLeds() const { return numLeds; }
+gpio_num_t AddressableLED::getPin() const { return pin; }
 LedType AddressableLED::getLedType() const { return ledType; }
 uint8_t AddressableLED::getBytesPerLed() const { return bytesPerLed; }
 TransportBackend AddressableLED::getBackend() const { return backend; }

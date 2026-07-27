@@ -395,6 +395,9 @@ public:
      * ═══════════════════════════════════════════════════════════════════ */
 
     uint16_t getNumLeds() const;
+
+    /** @brief GPIO carrying the strip's data line. */
+    gpio_num_t getPin() const;
     LedType getLedType() const;
     uint8_t getBytesPerLed() const;
     TransportBackend getBackend() const;
