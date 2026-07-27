@@ -3599,3 +3599,138 @@ Strip grew +4,866 B over v2. Six files rewritten, **zero compile errors on first
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##################################################################################################################################################################################################################
+
+# Dev Log � 27/07/2026 (Mon, session 2)
+
+**Project:** Smart Home Ecosystem � firmware repository
+**Scope:** Close the SET_LOCATION desync gap left open by v3; exercise group addressing on hardware
+**Outcome:** ? Both unticked boxes from session 1 closed. Phase 1 is done.
+
+---
+
+## The gap
+
+v3 shipped `MessageProtocol::sendLocation()`, which re-addresses a device over the air.
+It works � and it desynchronises the hub, because `MessageProtocol` knows nothing about
+the paired list. Move the strip to room 2 and the strip updates its NVS while the hub's
+`PairedDevice` record still reads r1/n2. Every later `sendCommandToGroup(2, ...)` would
+silently miss a device the hub believes is somewhere else. No error, no log, no symptom
+until someone notices a light not responding.
+
+The fix belongs in `auto_pair`, which owns the record.
+
+## `relocateDevice(uid, room, node)`
+
+Sends `SET_LOCATION` reliably and updates the local record **only once the device ACKs**.
+
+Committing first and sending second would produce the mirror-image bug. Send-then-commit
+means a failed move leaves both sides consistent at the old address � a stale hub record is
+strictly worse than a move that didn't happen.
+
+"Wait for the ACK" is not a straight line, though. `sendCommandReliable()` returns when the
+first TX is queued, not when the ACK lands, so the commit has to happen on a later code path.
+Hence a small in-flight table (`_reloc`) plus `noteDeliveryResult()`, fed from the hub's
+existing `MsgDeliveryCb`. One line in `main.cpp`; no change to `message_protocol`.
+
+**Correlation is on `(cmd, dst_uid)`, not `seq`.** The ACK can arrive before
+`sendCommandReliable()` has returned, so a seq recorded afterwards would race against its own
+completion. One move per device at a time makes the uid a sufficient key, and the "already in
+flight" guard is what enforces that.
+
+Two refusals rather than two silent overwrites:
+- An explicitly requested room/node that is already occupied ? `ESP_ERR_INVALID_ARG`.
+  Two devices at one address makes group sends hit both � the exact class of bug being closed.
+- A second move for a device whose first is still unconfirmed ? `ESP_ERR_INVALID_STATE`.
+
+`node = NODE_UNASSIGNED` auto-allocates: keeps the current number if the device is already in
+the target room, otherwise the lowest free one. `allocateNodeLocked()` returns `NODE_ALL-1`
+on a full room, which would collide silently, so the result is verified rather than trusted.
+
+`MessageProtocol::sendLocation()` still exists and is now the footgun � it moves the device
+and leaves the hub stale. Controller code must not call it.
+
+## Bench test � passed
+
+Temporary timed sequence in the hub's main loop, removed after passing. Four stages:
+
+| Stage | Action | Result |
+|---|---|---|
+| 1 | `relocateDevice(uid, room 2)` | ? Moving ? ACK ? confirmed, ~30 ms end to end |
+| 2 | `IDENTIFY` ? room 2 | ? received, strip flashed |
+| 3 | `IDENTIFY` ? room 1 (old) | ? **not received**, strip silent |
+| 4 | `IDENTIFY` ? broadcast | ? received, strip flashed |
+
+Stage 4 is the control. Without it, a strip that had crashed during stage 2 would make
+stage 3's silence look like a pass.
+
+The proof is in what the strip log does *not* contain: the hub logged
+`TX CMD IDENTIFY seq=4651 FEBDCDC3?r1/*` and the strip has no matching RX line, while
+4649 (r2) and 4652 (ALL) are both present. The drop happened in the RX room filter,
+not on the radio.
+
+Hub NVS confirmed across a reboot: banner came back `[0] EE907A91 Light r2/n2`.
+
+**Still unverified:** the strip's own NVS after a power cycle. The serial link dropped and
+reconnected mid-session, which looks like a reboot in the log but is not one � the strip's
+uptime counter ran straight through it. Worth doing before the strip goes on a ceiling.
+
+---
+
+## Key takeaways
+
+1. **A shared fact needs a single owner.** House/room/node lives in two places � the device
+   and the hub's record. Any code path that writes one without the other is a desync waiting
+   to happen. `sendLocation()` sat in the layer that couldn't see the record; that was the
+   whole bug.
+2. **Order of operations decides which side goes stale.** Send-then-commit and
+   commit-then-send are both "correct" until a packet is lost. Only one of them fails safe.
+3. **A test that can only pass is not a test.** Stages 2 and 4 exist to prove the silence in
+   stage 3 meant filtering rather than a dead node.
+4. **Flash delta is a better staleness signal than build duration.** A 7.9 s build looked
+   suspicious but added 2.6 KB � real. Duration only tells you how *much* recompiled.
+5. **`Select-String` is case-insensitive by default.** A count of `_reloc` returned 33
+   instead of 27 because `AUTOPAIR_MAX_RELOCATES` matched too. Same family as the
+   `-like '??*'` trap: the tool's default was not the assumed one.
+6. **Line endings: this repo is LF.** `\\
+` in a PowerShell `.Replace()` silently
+   injects CRLF into an LF file. Two lines were mixed before being caught. Here-strings pasted
+   through the console arrive as LF, which is why only the explicit escapes were affected.
+   Check before committing, not after.
+7. **`esp_app_desc` build timestamps go stale on incremental builds.** The hub banner read
+   `built Jul 25` on an image built today, because the file carrying `__DATE__` didn't
+   recompile. Harmless today; **not** harmless in Phase 2, where identifying which image is in
+   which slot is the entire job. OTA will need a version source that isn't this field.
+
+---
+
+## Files changed
+
+- `system/auto_pair/auto_pair.h` � `AUTOPAIR_MAX_RELOCATES`, `relocateDevice()`,
+  `noteDeliveryResult()`, `PendingRelocate`, `_reloc[]`, `nodeFreeLocked()`
+- `system/auto_pair/auto_pair.cpp` � the three new functions; ctor clears `_reloc`;
+  `forgetDevice()` / `forgetAll()` drop in-flight moves
+- `testing/devices/smart-light-test/hub/main/main.cpp` � one line wiring
+  `noteDeliveryResult()` into the delivery callback
+
+Untouched: `message_protocol.*`, strip `main.cpp`, all `CMakeLists.txt`.
+
+---
+
+## Next steps
+
+- [ ] Power-cycle the strip and confirm its NVS still reads room 2
+- [ ] **Phase 2 � make the strip un-brickable:** OTA transport-neutral sink API
+      (`beginWrite`/`writeChunk`/`finishWrite`/`abortWrite`), ESP-NOW bulk plane,
+      chunked transfer, CRC32 verify, boot flip, deliberate-corrupt-image rollback test
+- [ ] OTA needs a firmware version source that survives incremental builds (see takeaway 7)
+- [ ] `processPairMessage()` returns void, so an unauthorised `SET_LOCATION` is dropped by
+      `onSetLocation()` and still ACKs OK. Benign today � the hub is always the authorised
+      controller � but "ACKed" currently means received, not applied. Needs a return value,
+      which touches both `main.cpp` files.
+- [ ] Strip state persistence in NVS + `power_on_behavior` byte (debounce writes ~10 s)
+- [ ] Change `storage` partition subtype `spiffs` ? `undefined` so nothing can format it
+- [ ] Pairing recovery: re-open for pairing if the hub is unheard for ~10 min, staying lit
+- [ ] GC9A01: hoist `spi_bus_initialize` into a shared display-bus module
+- [ ] TouchSensor reports `initial state: TOUCHED` at boot on both pads � phantom touch
+- [ ] Encoder: guard `gpio_install_isr_service` already-installed

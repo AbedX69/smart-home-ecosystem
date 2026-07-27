@@ -66,6 +66,7 @@ static const char* TAG = "hub";
 static int64_t s_last_tx_us[2] = {0, 0};
 
 
+
 /* ─── Paired-light lookup: panel index -> Nth paired LIGHT ────────────────── */
 
 static DeviceUid getLightUid(int which) {
@@ -219,6 +220,7 @@ extern "C" void app_main(void) {
     });
     msg.setDeliveryCallback([](uint16_t seq, CmdId cmd, bool delivered,
                                AckStatus st, DeviceUid dst_uid) {
+        AutoPair::instance().noteDeliveryResult(cmd, dst_uid, delivered);
         if (!delivered) {
             ESP_LOGW(TAG, "%s seq=%u NOT delivered to %08X — node offline?",
                      MessageProtocol::cmdName(cmd), seq, (unsigned)dst_uid);

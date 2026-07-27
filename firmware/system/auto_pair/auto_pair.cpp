@@ -73,6 +73,7 @@ AutoPair::AutoPair()
     memset(_pending, 0, sizeof(_pending));
     memset(_paired, 0, sizeof(_paired));
     memset(_addr, 0, sizeof(_addr));
+    memset(_reloc, 0, sizeof(_reloc));
     _mutex = xSemaphoreCreateMutex();
 }
 
@@ -330,6 +331,165 @@ NodeId AutoPair::allocateNodeLocked(RoomId room) const {
     return NODE_ALL - 1;    /* room full; overwrite the last slot */
 }
 
+/* Is (room, node) free? `except` is skipped -- that is the device being
+ * moved. Checks committed records AND moves still awaiting confirmation,
+ * so two relocations cannot be aimed at the same slot.
+ * Caller holds _mutex. */
+bool AutoPair::nodeFreeLocked(RoomId room, NodeId node, DeviceUid except) const {
+    for (uint8_t i = 0; i < _paired_count; i++) {
+        if (_paired[i].uid == except) continue;
+        if (_paired[i].room == room && _paired[i].node == node) return false;
+    }
+    for (uint8_t i = 0; i < AUTOPAIR_MAX_RELOCATES; i++) {
+        if (!_reloc[i].used || _reloc[i].uid == except) continue;
+        if (_reloc[i].room == room && _reloc[i].node == node) return false;
+    }
+    return true;
+}
+
+/* Move a paired device, keeping our record in sync with the device.
+ *
+ * The record is NOT updated here. It is updated in noteDeliveryResult()
+ * when the device ACKs. If the move never lands, both sides stay at the
+ * old address -- a stale hub record is worse than a failed move, because
+ * every subsequent sendCommandToGroup() silently misses the device. */
+esp_err_t AutoPair::relocateDevice(DeviceUid uid, RoomId room, NodeId node) {
+    DeviceIdentity& id = DeviceIdentity::instance();
+
+    /* Read identity BEFORE locking -- nothing in this file calls out while
+     * holding _mutex, and that rule is what keeps resolveUid() safe. */
+    HouseId house     = id.house();
+    RoomId  self_room = id.room();
+    NodeId  self_node = id.node();
+
+    if (room == ROOM_UNASSIGNED || room == ROOM_ALL) {
+        ESP_LOGE(TAG, "relocate: room %u is not an address", (unsigned)room);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (node == NODE_ALL) {
+        ESP_LOGE(TAG, "relocate: node %u is not an address", (unsigned)node);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (node != NODE_UNASSIGNED && room == self_room && node == self_node) {
+        ESP_LOGE(TAG, "relocate: r%u/n%u is this controller",
+                 (unsigned)room, (unsigned)node);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    lock();
+    if (!_is_controller) { unlock(); return ESP_ERR_INVALID_STATE; }
+
+    int i = findPairedLocked(uid);
+    if (i < 0) { unlock(); return ESP_ERR_NOT_FOUND; }
+
+    for (uint8_t j = 0; j < AUTOPAIR_MAX_RELOCATES; j++) {
+        if (_reloc[j].used && _reloc[j].uid == uid) {
+            unlock();
+            ESP_LOGW(TAG, "relocate: %08X already has a move in flight",
+                     (unsigned)uid);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    NodeId target = node;
+    if (node == NODE_UNASSIGNED) {
+        /* Already in that room -> keep the number it has. */
+        target = (_paired[i].room == room) ? _paired[i].node
+                                           : allocateNodeLocked(room);
+        /* allocateNodeLocked() returns NODE_ALL-1 on a full room, which
+         * would collide silently. Verify rather than trust. */
+        if (!nodeFreeLocked(room, target, uid)) {
+            unlock();
+            ESP_LOGE(TAG, "relocate: room %u is full", (unsigned)room);
+            return ESP_ERR_NO_MEM;
+        }
+    } else if (!nodeFreeLocked(room, target, uid)) {
+        unlock();
+        ESP_LOGE(TAG, "relocate: r%u/n%u occupied -- refusing. Two devices "
+                      "at one address makes group sends hit both.",
+                 (unsigned)room, (unsigned)target);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int slot = -1;
+    for (uint8_t j = 0; j < AUTOPAIR_MAX_RELOCATES; j++) {
+        if (!_reloc[j].used) { slot = j; break; }
+    }
+    if (slot < 0) {
+        unlock();
+        ESP_LOGE(TAG, "relocate: %d moves already in flight",
+                 AUTOPAIR_MAX_RELOCATES);
+        return ESP_ERR_NO_MEM;
+    }
+    _reloc[slot].used = true;
+    _reloc[slot].uid  = uid;
+    _reloc[slot].room = room;
+    _reloc[slot].node = target;
+
+    RoomId old_room = _paired[i].room;
+    NodeId old_node = _paired[i].node;
+    unlock();
+
+    /* Reliable on purpose. Do NOT call MessageProtocol::sendLocation() from
+     * controller code -- it moves the device and leaves our record stale. */
+    uint8_t p[4];
+    msgEncodeLocation(p, house, room, target);
+    esp_err_t ret = MessageProtocol::instance().sendCommandReliable(
+        uid, CmdId::SET_LOCATION, p, 4);
+
+    if (ret != ESP_OK) {
+        lock();
+        memset(&_reloc[slot], 0, sizeof(_reloc[slot]));
+        unlock();
+        ESP_LOGE(TAG, "relocate: send failed (0x%x)", ret);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Moving %08X  r%u/n%u -> r%u/n%u  (awaiting confirmation)",
+             (unsigned)uid, (unsigned)old_room, (unsigned)old_node,
+             (unsigned)room, (unsigned)target);
+    return ESP_OK;
+}
+
+/* Fed from the app's MessageProtocol delivery callback.
+ *
+ * Correlates on (cmd, dst_uid) rather than seq: the ACK can arrive before
+ * sendCommandReliable() has even returned, so a seq stored afterwards would
+ * race. One move per device at a time makes the uid a sufficient key. */
+void AutoPair::noteDeliveryResult(CmdId cmd, DeviceUid dst_uid, bool delivered) {
+    if (cmd != CmdId::SET_LOCATION) return;
+
+    lock();
+    int r = -1;
+    for (uint8_t j = 0; j < AUTOPAIR_MAX_RELOCATES; j++) {
+        if (_reloc[j].used && _reloc[j].uid == dst_uid) { r = (int)j; break; }
+    }
+    if (r < 0) { unlock(); return; }
+
+    RoomId room = _reloc[r].room;
+    NodeId node = _reloc[r].node;
+    memset(&_reloc[r], 0, sizeof(_reloc[r]));
+
+    if (!delivered) {
+        unlock();
+        ESP_LOGW(TAG, "Move of %08X to r%u/n%u NOT confirmed -- record "
+                      "left unchanged", (unsigned)dst_uid,
+                 (unsigned)room, (unsigned)node);
+        return;
+    }
+
+    int i = findPairedLocked(dst_uid);
+    if (i >= 0) {
+        _paired[i].room = room;
+        _paired[i].node = node;
+        savePairedList();
+    }
+    unlock();
+
+    ESP_LOGI(TAG, "Move of %08X confirmed -- now r%u/n%u",
+             (unsigned)dst_uid, (unsigned)room, (unsigned)node);
+}
+
 esp_err_t AutoPair::acceptDevice(DeviceUid uid) {
     DeviceIdentity& id = DeviceIdentity::instance();
 
@@ -451,6 +611,9 @@ esp_err_t AutoPair::forgetDevice(DeviceUid uid) {
 
     uint8_t gone[6];
     memcpy(gone, _paired[i].mac, 6);
+    for (uint8_t j = 0; j < AUTOPAIR_MAX_RELOCATES; j++) {
+        if (_reloc[j].used && _reloc[j].uid == uid) memset(&_reloc[j], 0, sizeof(_reloc[j]));
+    }
     for (uint8_t j = i; j + 1 < _paired_count; j++) _paired[j] = _paired[j + 1];
     _paired_count--;
     savePairedList();
@@ -469,6 +632,7 @@ void AutoPair::forgetAll() {
     uint8_t count = _paired_count;
     uint8_t macs[AUTOPAIR_MAX_PAIRED][6];
     for (uint8_t i = 0; i < count; i++) memcpy(macs[i], _paired[i].mac, 6);
+    memset(_reloc, 0, sizeof(_reloc));
     _paired_count = 0;
     savePairedList();
     memset(_addr, 0, sizeof(_addr));

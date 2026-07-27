@@ -180,6 +180,9 @@
  * takes node 1, so children start at 2. */
 #define AUTOPAIR_FIRST_NODE         2
 
+/* Max device moves in flight (sent, awaiting confirmation) at once */
+#define AUTOPAIR_MAX_RELOCATES      4
+
 /* ─── Pairing State (device side) ─────────────────────────────────────────── */
 
 enum class PairState : uint8_t {
@@ -337,11 +340,51 @@ public:
     /** @brief Remove all paired devices. */
     void forgetAll();
 
+    /**
+     * @brief Move a paired device to a new room/node, keeping this
+     *        controller's record in sync with the device itself.
+     *
+     * Sends SET_LOCATION reliably and updates the local PairedDevice record
+     * ONLY once the device ACKs. A failed move therefore leaves both sides
+     * at the old address rather than desynchronised -- which is the whole
+     * point: a hub that believes a device is in room 2 when it is still in
+     * room 1 will silently miss it on every group send.
+     *
+     * @param node  NODE_UNASSIGNED = allocate the lowest free number in the
+     *              target room (keeps its current number if already there).
+     *              An explicit number that is already occupied is REFUSED,
+     *              not overwritten -- two devices sharing r/n is exactly the
+     *              class of silent bug this function exists to prevent.
+     *
+     * @return ESP_OK              move sent (not yet confirmed)
+     *         ESP_ERR_INVALID_ARG bad room/node, or the slot is taken
+     *         ESP_ERR_NOT_FOUND   uid is not paired to this controller
+     *         ESP_ERR_INVALID_STATE not a controller, or move already in flight
+     *         ESP_ERR_NO_MEM      room full, or no free in-flight slot
+     */
+    esp_err_t relocateDevice(DeviceUid uid, RoomId room,
+                             NodeId node = NODE_UNASSIGNED);
+
+    /**
+     * @brief Feed reliable-send outcomes in from your MessageProtocol
+     *        delivery callback. Everything except SET_LOCATION is ignored,
+     *        so it is safe to call unconditionally.
+     */
+    void noteDeliveryResult(CmdId cmd, DeviceUid dst_uid, bool delivered);
+
 private:
     AutoPair();
     ~AutoPair();
 
     /* One UID→MAC mapping */
+    /* One device move: sent, not yet confirmed by the device */
+    struct PendingRelocate {
+        bool      used;
+        DeviceUid uid;
+        RoomId    room;
+        NodeId    node;
+    };
+
     struct AddressEntry {
         bool      used;
         DeviceUid uid;
@@ -374,6 +417,7 @@ private:
     int    findAddrLocked(DeviceUid uid) const;
     void   noteAddressLocked(DeviceUid uid, const uint8_t mac[6]);
     NodeId allocateNodeLocked(RoomId room) const;
+    bool   nodeFreeLocked(RoomId room, NodeId node, DeviceUid except) const;
 
     void lock() const;
     void unlock() const;
@@ -399,6 +443,9 @@ private:
 
     /* Address table (both roles) */
     AddressEntry    _addr[AUTOPAIR_ADDR_ENTRIES];
+
+    /* Moves awaiting ACK (controller only) */
+    PendingRelocate _reloc[AUTOPAIR_MAX_RELOCATES];
 
     /* Callbacks */
     PairRequestCb   _request_cb;
