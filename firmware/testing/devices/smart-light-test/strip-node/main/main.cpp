@@ -1,10 +1,11 @@
 /**
  * @file main.cpp
- * @brief STRIP NODE (Seeed XIAO ESP32-C6) — MessageProtocol v2 + AutoPair.
+ * @brief STRIP NODE (Seeed XIAO ESP32-C6) — MessageProtocol v3 + AutoPair v3.
  *
- * No hardcoded MACs anywhere. On first boot the node broadcasts
- * PAIR_REQUEST until the hub accepts; the pairing persists in NVS, so
- * every later boot goes straight to paired operation.
+ * No hardcoded MACs and no hardcoded addresses anywhere. On first boot the
+ * node broadcasts PAIR_REQUEST until a hub accepts; the hub's PAIR_ACCEPT
+ * carries house/room/node, which the node persists. Every later boot goes
+ * straight to paired, commissioned operation.
  *
  * Pairing feedback on the strip itself:
  *   dim blue   = searching for a hub
@@ -12,7 +13,7 @@
  *   red x3     = rejected
  *
  * WIRING: unchanged — DATA -> D10 (GPIO18), common GND, 5V from bench.
- * FLASH ORDER: doesn't matter anymore. Flash both, watch them pair.
+ * FLASH ORDER: doesn't matter. Flash both, watch them pair.
  */
 
 #include <freertos/FreeRTOS.h>
@@ -35,7 +36,7 @@ static const char* TAG = "strip_node";
 static SmartLightDevice s_strip(STRIP_PIN, NUM_LEDS);
 
 
-/* ─── Pairing feedback rendered on the strip ─────────────────────────────── */
+/* ─── Pairing feedback rendered on the strip ──────────────────────────────── */
 
 static void showPairLED(PairLED pattern) {
     switch (pattern) {
@@ -78,14 +79,14 @@ static void showPairLED(PairLED pattern) {
 }
 
 
-/* ─── Command handler ────────────────────────────────────────────────────── */
+/* ─── Command handler ─────────────────────────────────────────────────────── */
 
 static AckStatus onCommand(CmdId cmd, const uint8_t* payload, uint8_t len,
-                           const uint8_t src_mac[6]) {
+                           DeviceUid src_uid) {
 
-    /* Pairing traffic goes to AutoPair */
+    /* Pairing and commissioning traffic goes to AutoPair */
     if (AutoPair::handlesCmd(cmd)) {
-        AutoPair::instance().processPairMessage(cmd, payload, len, src_mac);
+        AutoPair::instance().processPairMessage(cmd, payload, len, src_uid);
         return AckStatus::OK;
     }
 
@@ -150,7 +151,6 @@ static AckStatus onCommand(CmdId cmd, const uint8_t* payload, uint8_t len,
 }
 
 
-
 static void logFirmwareIdentity(void) {
     const esp_partition_t* running = esp_ota_get_running_partition();
     const esp_app_desc_t*  desc    = esp_app_get_description();
@@ -163,12 +163,36 @@ static void logFirmwareIdentity(void) {
     ESP_LOGI(TAG, "══════════════════════════════════════════");
 }
 
-/* ─── app_main ───────────────────────────────────────────────────────────── */
+static void logDeviceIdentity(void) {
+    DeviceIdentity& id = DeviceIdentity::instance();
+    AutoPair&       pr = AutoPair::instance();
+    ESP_LOGI(TAG, "══════════════════════════════════════════");
+    ESP_LOGI(TAG, "  UID %s", id.uidString());
+    ESP_LOGI(TAG, "  House 0x%04X  room %u  node %u",
+             (unsigned)id.house(), (unsigned)id.room(), (unsigned)id.node());
+    if (pr.isPaired()) {
+        ESP_LOGI(TAG, "  Controller %08X", (unsigned)pr.getControllerUid());
+    } else {
+        ESP_LOGI(TAG, "  Not paired — searching");
+    }
+    ESP_LOGI(TAG, "══════════════════════════════════════════");
+}
+
+/* ─── app_main ────────────────────────────────────────────────────────────── */
 
 extern "C" void app_main(void) {
     logFirmwareIdentity();
-    DeviceIdentity::instance().begin();
-    ESP_LOGI(TAG, "Strip node starting (v2 protocol, %d LEDs on GPIO %d)...",
+
+    /* NVS first — DeviceIdentity and AutoPair both persist here. */
+    ConfigStore::instance().begin();
+
+    /* Identity before anything that stamps or filters a packet. */
+    if (DeviceIdentity::instance().begin() != ESP_OK) {
+        ESP_LOGE(TAG, "DeviceIdentity failed — cannot continue");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Strip node starting (v3 protocol, %d LEDs on GPIO %d)...",
              NUM_LEDS, (int)STRIP_PIN);
 
     if (!s_strip.init()) {
@@ -186,22 +210,26 @@ extern "C" void app_main(void) {
     s_strip.setOn(false);
     s_strip.update();
 
-    /* NVS — AutoPair persistence lives here */
-    ConfigStore::instance().begin();
+    /* ── Protocol ──────────────────────────────────────────────────────
+     * Wired up BEFORE the radio starts. The ESP-NOW RX task begins
+     * delivering packets the moment enm.begin() returns, and a packet
+     * that arrives before msg.begin() would be handled with no identity.
+     * ───────────────────────────────────────────────────────────────── */
+    MessageProtocol& msg = MessageProtocol::instance();
 
-    /* Radio */
-    EspNowManager& enm = EspNowManager::instance();
-    enm.setReceiveCallback([](const uint8_t* sender, const uint8_t* data, int len) {
-        MessageProtocol::instance().processMessage(data, (uint8_t)len);
+    /* The UID→MAC seam. AutoPair owns the table today; device_registry v2
+     * will take over these two lambdas and nothing else will change. */
+    msg.setUidResolver([](DeviceUid uid, uint8_t mac[6]) {
+        return AutoPair::instance().resolveUid(uid, mac);
     });
-    if (enm.begin() != ESP_OK) {              /* prints this device's MAC */
-        ESP_LOGE(TAG, "ESP-NOW init failed");
+    msg.setPeerObservedCallback([](DeviceUid uid, const uint8_t mac[6]) {
+        AutoPair::instance().noteAddress(uid, mac);
+    });
+
+    if (msg.begin() != ESP_OK) {
+        ESP_LOGE(TAG, "MessageProtocol init failed");
         return;
     }
-
-    /* Protocol */
-    MessageProtocol& msg = MessageProtocol::instance();
-    msg.begin();
     msg.registerTransport(TRANSPORT_ESPNOW,
         [](const uint8_t* data, uint8_t len) {                    /* broadcast */
             static const uint8_t B[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -212,18 +240,36 @@ extern "C" void app_main(void) {
         });
     msg.setCommandHandler(onCommand);
 
-    /* Pairing */
+    /* ── Pairing ───────────────────────────────────────────────────────
+     * Callbacks before begin(): begin() replays peer-adds from NVS.
+     * ───────────────────────────────────────────────────────────────── */
     AutoPair& pair = AutoPair::instance();
     pair.setPeerAddCallback([](const uint8_t mac[6]) {
         EspNowManager::instance().addPeer(mac);
     });
     pair.setLEDCallback(showPairLED);
-    pair.setPairResultCallback([](bool ok, const uint8_t ctrl[6]) {
-        ESP_LOGI(TAG, "Pairing %s (hub %02X:%02X:%02X:%02X:%02X:%02X)",
-                 ok ? "ACCEPTED" : "rejected",
-                 ctrl[0], ctrl[1], ctrl[2], ctrl[3], ctrl[4], ctrl[5]);
+    pair.setPairResultCallback([](bool ok, DeviceUid ctrl) {
+        ESP_LOGI(TAG, "Pairing %s (hub %08X)",
+                 ok ? "ACCEPTED" : "rejected", (unsigned)ctrl);
     });
+
+    /* ── Radio ─────────────────────────────────────────────────────────
+     * The third argument is the transport-level source MAC. It is the
+     * only MAC that crosses into the protocol layer, and it exists so
+     * the address table can learn who is where.
+     * ───────────────────────────────────────────────────────────────── */
+    EspNowManager& enm = EspNowManager::instance();
+    enm.setReceiveCallback([](const uint8_t* sender, const uint8_t* data, int len) {
+        MessageProtocol::instance().processMessage(data, (uint8_t)len, sender);
+    });
+    if (enm.begin() != ESP_OK) {              /* prints this device's MAC */
+        ESP_LOGE(TAG, "ESP-NOW init failed");
+        return;
+    }
+
     pair.begin(DeviceRole::LIGHT, "Strip 1");
+
+    logDeviceIdentity();
 
     while (true) {
         pair.update();
