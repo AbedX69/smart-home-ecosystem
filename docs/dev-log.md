@@ -3292,6 +3292,307 @@ Image growth from linking `device_identity`: hub 803,285 → 805,568 B, strip 89
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+# Dev Log — 27/07/2026 (Mon)
+
+**Project:** Smart Home Ecosystem — firmware repository
+**Scope:** Close Phase 1 open items; freeze the v3 wire format (UID + house/room/node addressing)
+**Outcome:** ✅ Phase 1 complete — MAC removed from the wire, pairing now commissions
+
+---
+
+## Summary
+
+Three jobs. First, close the two boxes left open on 25/07 — the strip's UID had never actually
+printed. Second, two small bugs found along the way. Third, the session's real work:
+**message_protocol v3**, which takes MAC out of the packet header entirely and replaces it with
+a permanent device UID plus logical house/room/node addressing.
+
+Six files were rewritten in one pass and both projects built clean on the first attempt. Pairing
+from blank flash on both sides completed in **70 ms**, including commissioning.
+
+---
+
+## Bugs
+
+### Bug 1 — Strip identity banner was never on disk
+
+**Problem:**
+Three reflashes across two sessions never printed the strip's UID. The 25/07 diagnosis (stale
+binary) was wrong. `Select-String main\main.cpp -Pattern "uidString"` returned nothing — the
+editor edit had never been saved. The `device_identity.h` include *was* present, which is why
+the build succeeded and the absence looked like a runtime problem.
+
+**Fix:**
+Inserted the banner from PowerShell instead of the editor, then verified on disk before
+spending a flash cycle:
+
+```powershell
+$c = $c.Replace($anchor, $anchor + $banner)
+Set-Content -Path $f -Value $c -NoNewline
+Select-String -Path $f -Pattern "uidString"     # must print before flashing
+```
+
+**Result:** `UID EE907A91` — an exact match for the CRC32 of `B4:3A:45:8A:81:74` computed
+independently on 25/07. Confirmed identical after a full `erase_flash`.
+
+---
+
+### Bug 2 — Strip configured for 2 MB flash on a 4 MB chip
+
+**Problem:**
+Every build printed `Warning! Flash memory size mismatch detected. Expected 4MB, found 2MB!`
+`sdkconfig.defaults` had no `CONFIG_ESPTOOLPY_FLASHSIZE` line at all, so ESP-IDF fell back to
+its 2 MB default.
+
+Nothing failed today because `app0` ends at `0x1E0000`, just under the 2 MB ceiling. But
+`app1` (`0x1E0000`–`0x3B0000`) and `storage` both sit entirely *above* it — OTA had nowhere to
+write. The partition CSV was correct throughout; this was the bootloader's view of the chip,
+which is a separate setting.
+
+**Fix:**
+
+```
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+```
+
+Then `Remove-Item sdkconfig.c6_seeed` — without deleting the cache the change is ignored.
+Rebuild took 51 s (vs 7–22 s incremental), confirming full regeneration.
+
+**Result:** `sdkconfig.c6_seeed:599 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y`. Warning gone. Hub was
+already correct at 16 MB from the 23/07 session.
+
+---
+
+### Bug 3 — `SmartLightDevice` logged the LED count as the GPIO number
+
+**Problem:**
+Logged `10 SK6812 RGBW LEDs on GPIO 10` while actually driving GPIO 18. Not a hardcoded
+string — a copy-paste bug passing the same getter twice:
+
+```cpp
+ESP_LOGI(TAG, "Initialized: %d SK6812 RGBW LEDs on GPIO %d",
+         _strip.getNumLeds(), (int)_strip.getNumLeds());   // ← twice
+```
+
+`AddressableLED` had no pin getter, and `SmartLightDevice` takes the pin in its constructor
+without storing it, so there was nothing correct to pass.
+
+**Fix:**
+Added `getPin()` to `AddressableLED` (the class that owns the pin) rather than caching a copy
+in `SmartLightDevice`. The hub UI will want it later too.
+
+```cpp
+gpio_num_t AddressableLED::getPin() const { return pin; }
+```
+
+**Result:** `Initialized: 10 SK6812 RGBW LEDs on GPIO 18`. Closes an item open since 10/07.
+
+---
+
+## Wire format v3
+
+MAC is gone from the header. A MAC is a property of a *radio*, not a device — ESP-NOW has one,
+LoRa does not — so carrying it in the packet welded the protocol to one transport and broke
+ecosystem rule #3 (swappable transport).
+
+| off | size | field | notes |
+|---|---|---|---|
+| 0 | 4 | `magic` | `"SMM3"` |
+| 4 | 4 | `src_uid` | |
+| 8 | 4 | `dst_uid` | `UID_NONE` → group address |
+| 12 | 2 | `house` | checked before anything else |
+| 14 | 2 | `seq` | |
+| 16 | 1 | `proto_ver` | 3 |
+| 17 | 1 | `msg_type` | |
+| 18 | 1 | `cmd_id` | |
+| 19 | 1 | `flags` | |
+| 20 | 1 | `dst_room` | `ROOM_ALL` = every room |
+| 21 | 1 | `dst_node` | `NODE_ALL` = every node in room |
+| 22 | 1 | `payload_len` | |
+| 23 | 1 | `status` | |
+| 24 | 24 | `payload` | |
+
+**48 bytes total, unchanged.** Two MAC arrays (12 B) out, two UIDs + house/room/node (12 B) in.
+
+Fields were reordered so every multi-byte value lands on its natural alignment — v2 had
+`src_mac` starting at offset 10. Free to fix during a break, impossible afterwards. Enforced
+by `static_assert` on `offsetof`.
+
+**Addressing:** `dst_uid != UID_NONE` → unicast. `dst_uid == UID_NONE` → group via
+`dst_room`/`dst_node`. Broadcast is `UID_NONE + ROOM_ALL + NODE_ALL`. `house` is an
+independent first gate; `HOUSE_UNASSIGNED (0)` matches everything in both directions so a
+factory-fresh device can still pair.
+
+---
+
+## The UID → MAC seam
+
+Removing MAC from the wire does not remove ESP-NOW's need for one. Resolution lives behind
+**two functions**, injected into `MessageProtocol`:
+
+```cpp
+msg.setUidResolver([](DeviceUid uid, uint8_t mac[6]) {
+    return AutoPair::instance().resolveUid(uid, mac);
+});
+msg.setPeerObservedCallback([](DeviceUid uid, const uint8_t mac[6]) {
+    AutoPair::instance().noteAddress(uid, mac);
+});
+```
+
+`auto_pair` owns the table today. When `device_registry v2` arrives it implements these two
+functions and **nothing else in the ecosystem changes** — that was the whole argument for
+deferring it rather than building it now against a requirement set of "one node, no UI".
+
+**Resolution failure is not an error.** A miss falls back to broadcast and the receiver filters
+on `dst_uid`. The resolver is a bandwidth optimisation, not a correctness requirement — which
+is exactly what lets pairing work before any mapping exists, and what makes a stale entry
+self-correct instead of bricking communication.
+
+The table is seeded from NVS at `begin()` (so unicast works on the first packet after reboot)
+and refreshed by observation of *all* inbound traffic in our house, not just packets addressed
+to us.
+
+---
+
+## Pairing now commissions
+
+`PAIR_ACCEPT` gained a 4-byte payload: `[house_lo, house_hi, room, node]`. Without it a paired
+device would sit at `HOUSE_UNASSIGNED` forever, matching every house in radio range — which
+defeats the entire point of the house id.
+
+- `beginAsController()` **self-provisions**: mints a house if it has none, takes room 1 / node 1.
+  A hub that could accept pairings while stamping house 0 would adopt, and be adopted by,
+  anything nearby.
+- New devices inherit the hub's room and get the lowest unused node ≥ 2.
+- `SET_LOCATION` (0x74) re-addresses a device over the air, **authorised to the device's own
+  paired controller only** — otherwise any device in range could re-address the installation.
+- `unpair()` clears house/room/node by default; a device that left its house must stop
+  answering to it.
+
+NVS record layout changed → new key `ap_devs2`. Old `ap_devs` is orphaned, not migrated.
+
+---
+
+## Test results
+
+| Test | Result |
+|---|---|
+| Strip UID after ESP_MAC_BASE fix | ✅ `EE907A91` — matches independent CRC32 |
+| Strip UID identical across full erase | ✅ unchanged |
+| Hub mints house on blank flash | ✅ `0x6F19`, room 1 node 1 |
+| Pair + commission from blank flash, both sides | ✅ **70 ms** (3881 → 3951 ms) |
+| `PAIR_ACCEPT` payload | ✅ `19 6F 01 02` = house `0x6F19`, r1, n2 |
+| ACK unicast before any pairing record existed | ✅ peer-observed hook resolved it |
+| Strip reboot — identity + pairing from NVS | ✅ zero `PAIR_REQ`, peer added at 3782 ms |
+| Hub reboot — `ap_devs2` record survives | ✅ `[0] EE907A91 Light r1/n2 "Strip 1"` |
+| Heartbeat unicast both ways post-reboot | ✅ 30.5 s intervals, ACKs match on UID |
+
+---
+
+## Build results
+
+| App | Target | RAM | Flash | Time | Result |
+|---|---|---|---|---|---|
+| `smart-light-test/strip-node` | c6_seeed | 11.9% (38,944 B) | 47.5% (902,099 B) | 22.0 s | ✅ PASS |
+| `smart-light-test/hub` | s3_wroom | 14.5% (47,428 B) | 19.3% (810,913 B) | 17.7 s | ✅ PASS |
+
+Strip grew +4,866 B over v2. Six files rewritten, **zero compile errors on first build**.
+
+---
+
+## Verified
+
+- [x] Strip UID confirmed as `EE907A91` after the ESP_MAC_BASE fix
+- [x] Strip UID confirmed identical across a full erase
+- [x] Strip flash size corrected to 4 MB — `app1` and `storage` now addressable
+- [x] `SmartLightDevice` logs the correct GPIO
+- [x] v3 header is 48 B with all multi-byte fields naturally aligned
+- [x] Both projects build clean
+- [x] Full pair + commission from blank flash on both sides
+- [x] Identity and pairing survive reboot on both devices
+- [x] Unicast works on first packet after reboot (address table seeded from NVS)
+- [ ] `SET_LOCATION` exercised on hardware — implemented, never called
+- [ ] `sendCommandToGroup` exercised on hardware — implemented, never called
+- [ ] Committed and pushed
+
+---
+
+## Files modified
+
+**`firmware/system/message_protocol/`**
+- `message_protocol.h` — v3.0.0. New packet struct, `MsgUidResolver`, `MsgPeerObservedCb`,
+  `SET_LOCATION`, `msgEncodeLocation`/`msgDecodeLocation`, `sendCommandToGroup`,
+  `sendLocation`. All callbacks and senders take `DeviceUid`.
+- `message_protocol.cpp` — v3.0.0. `begin()` hard-fails without `DeviceIdentity`. Two-gate RX
+  filter. Dedup rekeyed to UID. Log format now `FEBDCDC3→EE907A91` / `ALL` / `r1/n2`.
+- `CMakeLists.txt` — `REQUIRES` += `core_types device_identity`
+
+**`firmware/system/auto_pair/`**
+- `auto_pair.h` / `auto_pair.cpp` — v3.0.0. UID-keyed throughout. Owns the address table.
+  `beginAsController()` self-provisions. `PAIR_ACCEPT` carries location. `SET_LOCATION`
+  handler with authorisation check. NVS key → `ap_devs2`.
+- `CMakeLists.txt` — `REQUIRES` += `device_identity`
+
+**`firmware/components/addressable/`**
+- `addressable_led.h` / `.cpp` — added `getPin()`
+
+**`firmware/testing/devices/smart-light-test/`**
+- `strip-node/main/main.cpp` — v3 handler signature; `app_main` reordered so the protocol
+  layer is fully wired before the radio starts; `ConfigStore` before `DeviceIdentity`;
+  `begin()` failures now bail.
+- `strip-node/sdkconfig.defaults` — flash size 4 MB
+- `hub/main/main.cpp` — same reordering; `getLightUid()` replaces `getLightMac()`; paired-list
+  boot banner; manual `provisionAsNewHouse()` removed (now in `beginAsController()`).
+
+---
+
+## Key takeaways
+
+1. **Verify an edit is on disk before spending a flash cycle.** Two sessions were lost to a
+   file that was never saved. `Select-String` for the new symbol costs nothing and would have
+   caught it immediately. Build time is a weak signal; on-disk content is the real one.
+2. **Partition CSV and `CONFIG_ESPTOOLPY_FLASHSIZE` are independent.** A correct partition
+   table can still be unreachable if the bootloader thinks the chip is smaller. Silent until
+   OTA needs the second slot.
+3. **Fix alignment during a wire-format break or never.** Reordering v3's header cost nothing
+   today and would have been impossible after devices shipped.
+4. **A resolver that may fail is more robust than one that must succeed.** Falling back to
+   broadcast means a missing or stale UID→MAC entry degrades bandwidth, not function — that
+   single property is what allows bootstrap (pairing before any mapping exists) and
+   self-healing (a device that changes radios recovers on its next packet).
+5. **Learn addresses from observation, not just from pairing.** The peer-observed hook proved
+   load-bearing on its first run: the strip ACKed the `PAIR_ACCEPT` as true unicast, before
+   any pairing record existed on its side.
+6. **Refuse to start rather than start wrong.** `MessageProtocol::begin()` fails if
+   `DeviceIdentity` isn't ready, because a packet accidentally stamped house 0 would be
+   accepted by every installation in radio range — a silent, near-undiagnosable failure.
+7. **Wire order before power order.** Both `app_main`s now finish protocol setup before the
+   radio starts; the RX task delivers packets the instant `enm.begin()` returns.
+
+---
+
+## Next steps
+
+- [ ] Exercise `SET_LOCATION` and `sendCommandToGroup` on the bench
+- [ ] **Phase 2 — make the strip un-brickable:** OTA transport-neutral sink API
+      (`beginWrite`/`writeChunk`/`finishWrite`/`abortWrite`), ESP-NOW bulk plane, chunked
+      transfer, CRC32 verify, boot flip, deliberate-corrupt-image rollback test
+- [ ] Strip state persistence in NVS + `power_on_behavior` byte (debounce writes ~10 s)
+- [ ] Change `storage` partition subtype `spiffs` → `undefined` so nothing can format it
+- [ ] Pairing recovery: re-open for pairing if the hub is unheard for ~10 min, staying lit
+- [ ] GC9A01: hoist `spi_bus_initialize` into a shared display-bus module (still logs E on the
+      second display)
+- [ ] TouchSensor reports `initial state: TOUCHED` at boot on both pads — phantom touch
+- [ ] Encoder: guard `gpio_install_isr_service` already-installed (benign E on second encoder)
+
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
