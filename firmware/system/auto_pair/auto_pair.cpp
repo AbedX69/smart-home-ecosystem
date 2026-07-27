@@ -3,43 +3,44 @@
  * FILE:        auto_pair.cpp
  * AUTHOR:      AbedX69
  * CREATED:     2026-07-13
- * VERSION:     2.0.0
+ * MODIFIED:    2026-07-27
+ * VERSION:     3.0.0
  * =============================================================================
  *
  * Locking rule used throughout this file:
  *   - mutate internal state while holding _mutex
  *   - copy whatever the callback needs onto the stack
  *   - RELEASE the mutex, THEN fire callbacks / send packets
- * This prevents deadlocks when a callback re-enters AutoPair
- * (e.g. the pair-request callback immediately calling acceptDevice()).
+ *
+ * In v3 this rule is load-bearing rather than merely tidy: MessageProtocol
+ * calls back into resolveUid() from inside every unicast send, and
+ * resolveUid() takes _mutex. Sending a packet while holding _mutex would
+ * deadlock instantly. Every send site in this file unlocks first.
  * =============================================================================
  */
 
 #include "auto_pair.h"
 #include "esp_timer.h"
-#include "esp_mac.h"
 
 static const char* TAG = "AutoPair";
-
-/* CmdId aliases — pairing rides on the CUSTOM_* range for now.
- * TODO: promote to dedicated PAIR_* entries in message_protocol.h
- * once the protocol header gets its next version bump. */
-static const CmdId CMD_PAIR_REQUEST = CmdId::PAIR_REQUEST;
-static const CmdId CMD_PAIR_ACCEPT  = CmdId::PAIR_ACCEPT;
-static const CmdId CMD_PAIR_REJECT  = CmdId::PAIR_REJECT;
 
 /* NVS keys (max 15 chars) */
 static const char* NVS_DEV_PAIRED   = "ap_paired";      /* bool            */
 static const char* NVS_DEV_CTRL_MAC = "ap_ctrl_mac";    /* blob, 6 bytes   */
-static const char* NVS_CTRL_DEVICES = "ap_devs";        /* blob, N×23 B    */
+static const char* NVS_DEV_CTRL_UID = "ap_ctrl_uid";    /* u32             */
+static const char* NVS_CTRL_DEVICES = "ap_devs2";       /* blob, N×29 B    */
 
-/* Packed on-flash record for the controller's paired list */
+/* Packed on-flash record for the controller's paired list.
+ * Layout changed in v3 → new key name, old "ap_devs" is simply orphaned. */
 struct __attribute__((packed)) PairedRecord {
-    uint8_t mac[6];
-    uint8_t role;
-    char    name[DEVICE_NAME_LEN];
+    uint32_t uid;
+    uint8_t  mac[6];
+    uint8_t  role;
+    uint8_t  room;
+    uint8_t  node;
+    char     name[DEVICE_NAME_LEN];
 };
-static_assert(sizeof(PairedRecord) == 6 + 1 + DEVICE_NAME_LEN,
+static_assert(sizeof(PairedRecord) == 4 + 6 + 1 + 1 + 1 + DEVICE_NAME_LEN,
               "PairedRecord layout changed — bump NVS key name");
 
 /* =============================================================================
@@ -54,7 +55,9 @@ AutoPair& AutoPair::instance() {
 AutoPair::AutoPair()
     : _is_controller(false)
     , _role(DeviceRole::UNKNOWN)
+    , _self_uid(UID_NONE)
     , _state(PairState::UNPAIRED)
+    , _controller_uid(UID_NONE)
     , _last_request_us(0)
     , _request_count(0)
     , _pending_count(0)
@@ -66,10 +69,10 @@ AutoPair::AutoPair()
     , _peer_remove_cb(nullptr)
 {
     memset(_name, 0, sizeof(_name));
-    memset(_self_mac, 0, sizeof(_self_mac));
     memset(_controller_mac, 0, sizeof(_controller_mac));
     memset(_pending, 0, sizeof(_pending));
     memset(_paired, 0, sizeof(_paired));
+    memset(_addr, 0, sizeof(_addr));
     _mutex = xSemaphoreCreateMutex();
 }
 
@@ -84,7 +87,76 @@ bool AutoPair::handlesCmd(CmdId cmd) {
     return cmd == CmdId::PAIR_REQUEST ||
            cmd == CmdId::PAIR_ACCEPT  ||
            cmd == CmdId::PAIR_REJECT  ||
-           cmd == CmdId::PAIR_UNPAIR;   /* reserved, routed but ignored for now */
+           cmd == CmdId::PAIR_UNPAIR  ||
+           cmd == CmdId::SET_LOCATION;
+}
+
+/* =============================================================================
+ * ADDRESS TABLE
+ * =============================================================================
+ * The one place in the ecosystem that still knows MACs exist. Seeded from
+ * NVS at begin() so unicast works immediately after a reboot, then kept
+ * fresh by observation of inbound traffic.
+ *
+ * A miss is not a failure — MessageProtocol falls back to broadcast and the
+ * receiver filters on dst_uid. That is what lets pairing happen before any
+ * mapping exists, and what makes a stale entry self-correct instead of
+ * bricking communication.
+ * ========================================================================== */
+
+int AutoPair::findAddrLocked(DeviceUid uid) const {
+    for (int i = 0; i < AUTOPAIR_ADDR_ENTRIES; i++) {
+        if (_addr[i].used && _addr[i].uid == uid) return i;
+    }
+    return -1;
+}
+
+void AutoPair::noteAddressLocked(DeviceUid uid, const uint8_t mac[6]) {
+    if (uid == UID_NONE || !mac) return;
+    int64_t now = esp_timer_get_time();
+
+    int i = findAddrLocked(uid);
+    if (i >= 0) {
+        if (memcmp(_addr[i].mac, mac, 6) != 0) {
+            ESP_LOGW(TAG, "UID %08X moved radio address", (unsigned)uid);
+            memcpy(_addr[i].mac, mac, 6);
+        }
+        _addr[i].last_seen_us = now;
+        return;
+    }
+
+    /* Free slot, else evict least recently seen */
+    int slot = -1;
+    int oldest = 0;
+    for (int j = 0; j < AUTOPAIR_ADDR_ENTRIES; j++) {
+        if (!_addr[j].used) { slot = j; break; }
+        if (_addr[j].last_seen_us < _addr[oldest].last_seen_us) oldest = j;
+    }
+    if (slot < 0) slot = oldest;
+
+    _addr[slot].used         = true;
+    _addr[slot].uid          = uid;
+    memcpy(_addr[slot].mac, mac, 6);
+    _addr[slot].last_seen_us = now;
+}
+
+void AutoPair::noteAddress(DeviceUid uid, const uint8_t mac[6]) {
+    lock();
+    noteAddressLocked(uid, mac);
+    unlock();
+}
+
+bool AutoPair::resolveUid(DeviceUid uid, uint8_t out_mac[6]) const {
+    if (uid == UID_NONE || !out_mac) return false;
+    lock();
+    int i = findAddrLocked(uid);
+    if (i >= 0) {
+        memcpy(out_mac, _addr[i].mac, 6);
+        unlock();
+        return true;
+    }
+    unlock();
+    return false;
 }
 
 /* =============================================================================
@@ -92,20 +164,31 @@ bool AutoPair::handlesCmd(CmdId cmd) {
  * ========================================================================== */
 
 esp_err_t AutoPair::begin(DeviceRole role, const char* name) {
+    DeviceIdentity& id = DeviceIdentity::instance();
+    if (!id.isReady()) {
+        ESP_LOGE(TAG, "DeviceIdentity::begin() must succeed first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     lock();
     _is_controller = false;
     _role = role;
     strncpy(_name, name ? name : "", DEVICE_NAME_LEN - 1);
     _name[DEVICE_NAME_LEN - 1] = '\0';
-    esp_read_mac(_self_mac, ESP_MAC_WIFI_STA);
+    _self_uid = id.uid();
 
     loadDevicePairing();
 
     bool paired = (_state == PairState::PAIRED);
-    uint8_t ctrl[6];
-    memcpy(ctrl, _controller_mac, 6);
+    DeviceUid ctrl_uid = _controller_uid;
+    uint8_t   ctrl_mac[6];
+    memcpy(ctrl_mac, _controller_mac, 6);
 
-    if (!paired) {
+    if (paired) {
+        /* Seed the address table so the first unicast doesn't have to
+         * broadcast while waiting to hear from the controller. */
+        noteAddressLocked(ctrl_uid, ctrl_mac);
+    } else {
         _state = PairState::REQUESTING;
         _last_request_us = 0;       /* first update() fires immediately */
         _request_count = 0;
@@ -113,9 +196,11 @@ esp_err_t AutoPair::begin(DeviceRole role, const char* name) {
     unlock();
 
     if (paired) {
-        ESP_LOGI(TAG, "Already paired to %02X:%02X:%02X:%02X:%02X:%02X",
-                 ctrl[0], ctrl[1], ctrl[2], ctrl[3], ctrl[4], ctrl[5]);
-        if (_peer_add_cb) _peer_add_cb(ctrl);   /* replay peer registration */
+        ESP_LOGI(TAG, "Already paired to controller %08X (house 0x%04X "
+                      "room %u node %u)",
+                 (unsigned)ctrl_uid, (unsigned)id.house(),
+                 (unsigned)id.room(), (unsigned)id.node());
+        if (_peer_add_cb) _peer_add_cb(ctrl_mac);   /* replay peer registration */
         if (_led_cb)      _led_cb(PairLED::OFF);
     } else {
         ESP_LOGI(TAG, "Not paired — broadcasting pair requests as \"%s\"", _name);
@@ -138,20 +223,35 @@ PairState AutoPair::getState() const {
     return s;
 }
 
+DeviceUid AutoPair::getControllerUid() const {
+    lock();
+    DeviceUid u = (_state == PairState::PAIRED) ? _controller_uid : UID_NONE;
+    unlock();
+    return u;
+}
+
 const uint8_t* AutoPair::getControllerMAC() const { return _controller_mac; }
 
-void AutoPair::unpair() {
+void AutoPair::unpair(bool clear_location) {
     lock();
     uint8_t old_ctrl[6];
     memcpy(old_ctrl, _controller_mac, 6);
     bool was_paired = (_state == PairState::PAIRED);
 
+    int ai = findAddrLocked(_controller_uid);
+    if (ai >= 0) memset(&_addr[ai], 0, sizeof(_addr[ai]));
+
     eraseDevicePairing();
     memset(_controller_mac, 0, 6);
-    _state = PairState::REQUESTING;
+    _controller_uid  = UID_NONE;
+    _state           = PairState::REQUESTING;
     _last_request_us = 0;
-    _request_count = 0;
+    _request_count   = 0;
     unlock();
+
+    /* A device that has left its house must stop answering to it, or it
+     * will keep accepting group commands from its old hub. */
+    if (clear_location) DeviceIdentity::instance().clearLocation();
 
     ESP_LOGI(TAG, "Unpaired — searching for a controller again");
     if (was_paired && _peer_remove_cb) _peer_remove_cb(old_ctrl);
@@ -163,32 +263,81 @@ void AutoPair::unpair() {
  * ========================================================================== */
 
 esp_err_t AutoPair::beginAsController() {
+    DeviceIdentity& id = DeviceIdentity::instance();
+    if (!id.isReady()) {
+        ESP_LOGE(TAG, "DeviceIdentity::begin() must succeed first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* A controller with no house that starts accepting pairings would stamp
+     * house 0 into every child, and house 0 matches everything — the whole
+     * installation would be adoptable by any hub in radio range. Mint one. */
+    if (!id.isProvisioned()) {
+        esp_err_t ret = id.provisionAsNewHouse();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not mint a house id: 0x%x", ret);
+            return ret;
+        }
+        ESP_LOGI(TAG, "New installation provisioned — house 0x%04X",
+                 (unsigned)id.house());
+    }
+    /* The controller occupies node 1 of its own room. */
+    if (id.room() == ROOM_UNASSIGNED || id.node() == NODE_UNASSIGNED) {
+        id.setLocation(id.house(),
+                       id.room() == ROOM_UNASSIGNED ? 1 : id.room(),
+                       1);
+    }
+
     lock();
     _is_controller = true;
-    _state = PairState::PAIRED;     /* a controller is always "paired" */
-    esp_read_mac(_self_mac, ESP_MAC_WIFI_STA);
+    _state         = PairState::PAIRED;     /* a controller is always "paired" */
+    _self_uid      = id.uid();
 
     loadPairedList();
 
-    /* Snapshot for peer replay outside the lock */
+    /* Seed the address table from NVS, and snapshot for peer replay */
     uint8_t count = _paired_count;
     uint8_t macs[AUTOPAIR_MAX_PAIRED][6];
-    for (uint8_t i = 0; i < count; i++) memcpy(macs[i], _paired[i].mac, 6);
+    for (uint8_t i = 0; i < count; i++) {
+        memcpy(macs[i], _paired[i].mac, 6);
+        noteAddressLocked(_paired[i].uid, _paired[i].mac);
+    }
     unlock();
 
-    ESP_LOGI(TAG, "Controller mode — %u paired device(s) loaded from NVS", count);
+    ESP_LOGI(TAG, "Controller mode — house 0x%04X room %u node %u, "
+                  "%u paired device(s) loaded from NVS",
+             (unsigned)id.house(), (unsigned)id.room(),
+             (unsigned)id.node(), count);
     if (_peer_add_cb) {
         for (uint8_t i = 0; i < count; i++) _peer_add_cb(macs[i]);
     }
     return ESP_OK;
 }
 
-esp_err_t AutoPair::acceptDevice(const uint8_t mac[6]) {
+/* Lowest unused node number in `room`, starting at AUTOPAIR_FIRST_NODE.
+ * Caller holds _mutex. */
+NodeId AutoPair::allocateNodeLocked(RoomId room) const {
+    for (NodeId n = AUTOPAIR_FIRST_NODE; n < NODE_ALL; n++) {
+        bool taken = false;
+        for (uint8_t i = 0; i < _paired_count; i++) {
+            if (_paired[i].room == room && _paired[i].node == n) {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken) return n;
+    }
+    return NODE_ALL - 1;    /* room full; overwrite the last slot */
+}
+
+esp_err_t AutoPair::acceptDevice(DeviceUid uid) {
+    DeviceIdentity& id = DeviceIdentity::instance();
+
     lock();
     if (!_is_controller) { unlock(); return ESP_ERR_INVALID_STATE; }
 
     /* Drop from pending if present */
-    int pi = findPendingLocked(mac);
+    int pi = findPendingLocked(uid);
     PairRequestInfo info = {};
     bool had_info = (pi >= 0);
     if (had_info) {
@@ -196,49 +345,73 @@ esp_err_t AutoPair::acceptDevice(const uint8_t mac[6]) {
         removePendingLocked(pi);
     }
 
-    /* Already paired? Just re-confirm. */
-    if (findPairedLocked(mac) < 0) {
+    RoomId assign_room;
+    NodeId assign_node;
+
+    int already = findPairedLocked(uid);
+    if (already >= 0) {
+        /* Known device re-pairing — keep its existing address. */
+        assign_room = _paired[already].room;
+        assign_node = _paired[already].node;
+    } else {
         if (_paired_count >= AUTOPAIR_MAX_PAIRED) {
             unlock();
             ESP_LOGE(TAG, "Paired list full (%d) — rejecting", AUTOPAIR_MAX_PAIRED);
-            sendPairResponse(mac, false);
+            sendPairReject(uid);
             return ESP_ERR_NO_MEM;
         }
+        assign_room = id.room();
+        assign_node = allocateNodeLocked(assign_room);
+
         PairedDevice& d = _paired[_paired_count++];
-        memcpy(d.mac, mac, 6);
+        memset(&d, 0, sizeof(d));
+        d.uid  = uid;
         d.role = had_info ? info.role : DeviceRole::UNKNOWN;
-        memset(d.name, 0, sizeof(d.name));
+        d.room = assign_room;
+        d.node = assign_node;
         if (had_info) strncpy(d.name, info.name, DEVICE_NAME_LEN - 1);
+
+        int ai = findAddrLocked(uid);
+        if (ai >= 0) memcpy(d.mac, _addr[ai].mac, 6);
+
         savePairedList();
     }
+
+    uint8_t mac[6] = {};
+    bool have_mac = false;
+    int ai = findAddrLocked(uid);
+    if (ai >= 0) { memcpy(mac, _addr[ai].mac, 6); have_mac = true; }
+
+    char nm[DEVICE_NAME_LEN];
+    strncpy(nm, had_info ? info.name : "?", DEVICE_NAME_LEN - 1);
+    nm[DEVICE_NAME_LEN - 1] = '\0';
     unlock();
 
     /* Peer BEFORE sending, so the accept goes out as true unicast */
-    if (_peer_add_cb) _peer_add_cb(mac);
-    sendPairResponse(mac, true);
+    if (have_mac && _peer_add_cb) _peer_add_cb(mac);
+    sendPairAccept(uid, assign_room, assign_node);
 
-    ESP_LOGI(TAG, "Accepted %02X:%02X:%02X:%02X:%02X:%02X (\"%s\")",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-             had_info ? info.name : "?");
+    ESP_LOGI(TAG, "Accepted %08X (\"%s\") → house 0x%04X room %u node %u",
+             (unsigned)uid, nm, (unsigned)id.house(),
+             (unsigned)assign_room, (unsigned)assign_node);
     return ESP_OK;
 }
 
-esp_err_t AutoPair::rejectDevice(const uint8_t mac[6]) {
+esp_err_t AutoPair::rejectDevice(DeviceUid uid) {
     lock();
     if (!_is_controller) { unlock(); return ESP_ERR_INVALID_STATE; }
-    int pi = findPendingLocked(mac);
+    int pi = findPendingLocked(uid);
     if (pi >= 0) removePendingLocked(pi);
     unlock();
 
-    /* No peer needed — MessageProtocol falls back to broadcast,
-     * and dst-MAC filtering makes sure only the target reacts. */
-    sendPairResponse(mac, false);
-    ESP_LOGI(TAG, "Rejected %02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    /* No peer needed — MessageProtocol falls back to broadcast, and
+     * dst_uid filtering makes sure only the target reacts. */
+    sendPairReject(uid);
+    ESP_LOGI(TAG, "Rejected %08X", (unsigned)uid);
     return ESP_OK;
 }
 
-/* ─── Pending accessors ──────────────────────────────────────────────────── */
+/* ─── Pending accessors ───────────────────────────────────────────────────── */
 
 uint8_t AutoPair::getPendingCount() const {
     lock();
@@ -251,7 +424,7 @@ const PairRequestInfo* AutoPair::getPending(uint8_t index) const {
     return (index < _pending_count) ? &_pending[index] : nullptr;
 }
 
-/* ─── Paired-list accessors ──────────────────────────────────────────────── */
+/* ─── Paired-list accessors ───────────────────────────────────────────────── */
 
 uint8_t AutoPair::getPairedCount() const {
     lock();
@@ -264,16 +437,16 @@ const PairedDevice* AutoPair::getPairedDevice(uint8_t index) const {
     return (index < _paired_count) ? &_paired[index] : nullptr;
 }
 
-bool AutoPair::isDevicePaired(const uint8_t mac[6]) const {
+bool AutoPair::isDevicePaired(DeviceUid uid) const {
     lock();
-    bool found = (findPairedLocked(mac) >= 0);
+    bool found = (findPairedLocked(uid) >= 0);
     unlock();
     return found;
 }
 
-esp_err_t AutoPair::forgetDevice(const uint8_t mac[6]) {
+esp_err_t AutoPair::forgetDevice(DeviceUid uid) {
     lock();
-    int i = findPairedLocked(mac);
+    int i = findPairedLocked(uid);
     if (i < 0) { unlock(); return ESP_ERR_NOT_FOUND; }
 
     uint8_t gone[6];
@@ -281,11 +454,13 @@ esp_err_t AutoPair::forgetDevice(const uint8_t mac[6]) {
     for (uint8_t j = i; j + 1 < _paired_count; j++) _paired[j] = _paired[j + 1];
     _paired_count--;
     savePairedList();
+
+    int ai = findAddrLocked(uid);
+    if (ai >= 0) memset(&_addr[ai], 0, sizeof(_addr[ai]));
     unlock();
 
     if (_peer_remove_cb) _peer_remove_cb(gone);
-    ESP_LOGI(TAG, "Forgot device %02X:%02X:%02X:%02X:%02X:%02X",
-             gone[0], gone[1], gone[2], gone[3], gone[4], gone[5]);
+    ESP_LOGI(TAG, "Forgot device %08X", (unsigned)uid);
     return ESP_OK;
 }
 
@@ -296,6 +471,7 @@ void AutoPair::forgetAll() {
     for (uint8_t i = 0; i < count; i++) memcpy(macs[i], _paired[i].mac, 6);
     _paired_count = 0;
     savePairedList();
+    memset(_addr, 0, sizeof(_addr));
     unlock();
 
     if (_peer_remove_cb) {
@@ -358,51 +534,67 @@ void AutoPair::update() {
 
 /* =============================================================================
  * MESSAGE HANDLING (entry point from MessageProtocol command handler)
+ * =============================================================================
+ * No MAC parameter in v3. By the time this runs, MessageProtocol has already
+ * fired setPeerObservedCallback() → noteAddress(), so src_uid is resolvable.
  * ========================================================================== */
 
 void AutoPair::processPairMessage(CmdId cmd, const uint8_t* payload,
-                                  uint8_t len, const uint8_t src_mac[6]) {
-    if (cmd == CMD_PAIR_REQUEST && _is_controller) {
-        onPairRequest(payload, len, src_mac);
-    } else if (cmd == CMD_PAIR_ACCEPT && !_is_controller) {
-        onPairAccept(src_mac);
-    } else if (cmd == CMD_PAIR_REJECT && !_is_controller) {
-        onPairReject(src_mac);
+                                  uint8_t len, DeviceUid src_uid) {
+    if (src_uid == UID_NONE) return;
+
+    if (cmd == CmdId::PAIR_REQUEST && _is_controller) {
+        onPairRequest(payload, len, src_uid);
+    } else if (cmd == CmdId::PAIR_ACCEPT && !_is_controller) {
+        onPairAccept(payload, len, src_uid);
+    } else if (cmd == CmdId::PAIR_REJECT && !_is_controller) {
+        onPairReject(src_uid);
+    } else if (cmd == CmdId::SET_LOCATION) {
+        onSetLocation(payload, len, src_uid);
     }
     /* Anything else (e.g. a controller receiving an ACCEPT) is ignored. */
 }
 
-/* ─── Controller: incoming PAIR_REQUEST ──────────────────────────────────── */
+/* ─── Controller: incoming PAIR_REQUEST ───────────────────────────────────── */
 
 void AutoPair::onPairRequest(const uint8_t* payload, uint8_t len,
-                             const uint8_t src_mac[6]) {
+                             DeviceUid src_uid) {
     if (len < 2) return;    /* need at least role + fw_major */
 
     lock();
 
     /* Known device re-requesting (re-flashed / lost its NVS)?
      * Re-accept silently — no popup, no user interaction. */
-    int paired_idx = findPairedLocked(src_mac);
+    int paired_idx = findPairedLocked(src_uid);
     if (paired_idx >= 0) {
-        /* Refresh stored identity in case the firmware changed it */
         _paired[paired_idx].role = (DeviceRole)payload[0];
         if (len > 2) {
             uint8_t nl = len - 2;
             if (nl > DEVICE_NAME_LEN - 1) nl = DEVICE_NAME_LEN - 1;
             memset(_paired[paired_idx].name, 0, DEVICE_NAME_LEN);
             memcpy(_paired[paired_idx].name, payload + 2, nl);
-            savePairedList();
         }
+        /* Refresh the stored MAC from what we just observed */
+        int ai = findAddrLocked(src_uid);
+        if (ai >= 0) memcpy(_paired[paired_idx].mac, _addr[ai].mac, 6);
+        savePairedList();
+
+        RoomId r = _paired[paired_idx].room;
+        NodeId n = _paired[paired_idx].node;
+        uint8_t mac[6];
+        bool have_mac = (ai >= 0);
+        if (have_mac) memcpy(mac, _addr[ai].mac, 6);
         unlock();
 
-        ESP_LOGI(TAG, "Known device re-requesting — auto re-accepting");
-        if (_peer_add_cb) _peer_add_cb(src_mac);
-        sendPairResponse(src_mac, true);
+        ESP_LOGI(TAG, "Known device %08X re-requesting — auto re-accepting",
+                 (unsigned)src_uid);
+        if (have_mac && _peer_add_cb) _peer_add_cb(mac);
+        sendPairAccept(src_uid, r, n);
         return;
     }
 
     /* Already pending? Refresh its timestamp, don't fire a second popup. */
-    int pi = findPendingLocked(src_mac);
+    int pi = findPendingLocked(src_uid);
     if (pi >= 0) {
         _pending[pi].first_seen_us = esp_timer_get_time();
         unlock();
@@ -418,9 +610,9 @@ void AutoPair::onPairRequest(const uint8_t* payload, uint8_t len,
     /* New device — record it */
     PairRequestInfo& slot = _pending[_pending_count++];
     memset(&slot, 0, sizeof(slot));
-    memcpy(slot.mac, src_mac, 6);
-    slot.role     = (DeviceRole)payload[0];
-    slot.fw_major = payload[1];
+    slot.uid           = src_uid;
+    slot.role          = (DeviceRole)payload[0];
+    slot.fw_major      = payload[1];
     slot.first_seen_us = esp_timer_get_time();
     if (len > 2) {
         uint8_t nl = len - 2;
@@ -430,59 +622,106 @@ void AutoPair::onPairRequest(const uint8_t* payload, uint8_t len,
     PairRequestInfo copy = slot;    /* stack copy for the callback */
     unlock();
 
-    ESP_LOGI(TAG, "╔═ PAIR REQUEST ═══════════════════════════════╗");
-    ESP_LOGI(TAG, "║  \"%s\" (%02X:%02X:%02X:%02X:%02X:%02X) role=%u",
-             copy.name, copy.mac[0], copy.mac[1], copy.mac[2],
-             copy.mac[3], copy.mac[4], copy.mac[5], (unsigned)copy.role);
-    ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "╔═ PAIR REQUEST ═══════════════════════════╗");
+    ESP_LOGI(TAG, "║  \"%s\"  uid %08X  role=%s",
+             copy.name, (unsigned)copy.uid, deviceRoleName(copy.role));
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
 
     if (_request_cb) _request_cb(&copy);
 }
 
-/* ─── Device: incoming PAIR_ACCEPT ───────────────────────────────────────── */
+/* ─── Device: incoming PAIR_ACCEPT ────────────────────────────────────────── */
 
-void AutoPair::onPairAccept(const uint8_t src_mac[6]) {
+void AutoPair::onPairAccept(const uint8_t* payload, uint8_t len,
+                            DeviceUid src_uid) {
+    HouseId h = HOUSE_UNASSIGNED;
+    RoomId  r = ROOM_UNASSIGNED;
+    NodeId  n = NODE_UNASSIGNED;
+    bool has_location = msgDecodeLocation(payload, len, h, r, n);
+
     lock();
     if (_state == PairState::PAIRED) {
-        bool same = (memcmp(_controller_mac, src_mac, 6) == 0);
+        bool same = (_controller_uid == src_uid);
         unlock();
         if (!same) {
-            ESP_LOGW(TAG, "ACCEPT from a second controller — ignoring. "
-                          "unpair() first to switch controllers.");
+            ESP_LOGW(TAG, "ACCEPT from a second controller (%08X) — ignoring. "
+                          "unpair() first to switch controllers.",
+                     (unsigned)src_uid);
         }
         return;     /* duplicate accept from own controller: silently drop */
     }
 
-    memcpy(_controller_mac, src_mac, 6);
+    _controller_uid = src_uid;
+    int ai = findAddrLocked(src_uid);
+    if (ai >= 0) memcpy(_controller_mac, _addr[ai].mac, 6);
     _state = PairState::PAIRED;
     saveDevicePairing();
-    uint8_t ctrl[6];
-    memcpy(ctrl, _controller_mac, 6);
+
+    uint8_t ctrl_mac[6];
+    memcpy(ctrl_mac, _controller_mac, 6);
     unlock();
 
-    ESP_LOGI(TAG, "╔═ PAIRED ═════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║  Controller: %02X:%02X:%02X:%02X:%02X:%02X",
-             ctrl[0], ctrl[1], ctrl[2], ctrl[3], ctrl[4], ctrl[5]);
-    ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
+    /* Commissioning. Do this OUTSIDE the lock — setLocation writes NVS. */
+    if (has_location && h != HOUSE_UNASSIGNED) {
+        DeviceIdentity::instance().setLocation(h, r, n);
+    } else {
+        ESP_LOGW(TAG, "PAIR_ACCEPT carried no location — device stays "
+                      "uncommissioned and will match any house");
+    }
 
-    if (_peer_add_cb) _peer_add_cb(ctrl);
+    DeviceIdentity& id = DeviceIdentity::instance();
+    ESP_LOGI(TAG, "╔═ PAIRED ═════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  Controller %08X", (unsigned)src_uid);
+    ESP_LOGI(TAG, "║  House 0x%04X  room %u  node %u",
+             (unsigned)id.house(), (unsigned)id.room(), (unsigned)id.node());
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
+
+    if (_peer_add_cb) _peer_add_cb(ctrl_mac);
     if (_led_cb)      _led_cb(PairLED::SOLID_ON);
-    if (_result_cb)   _result_cb(true, ctrl);
+    if (_result_cb)   _result_cb(true, src_uid);
 }
 
-/* ─── Device: incoming PAIR_REJECT ───────────────────────────────────────── */
+/* ─── Device: incoming PAIR_REJECT ────────────────────────────────────────── */
 
-void AutoPair::onPairReject(const uint8_t src_mac[6]) {
+void AutoPair::onPairReject(DeviceUid src_uid) {
     lock();
     if (_state == PairState::PAIRED) { unlock(); return; }
     _state = PairState::REJECTED;
     _last_request_us = esp_timer_get_time();
     unlock();
 
-    ESP_LOGW(TAG, "Pair request rejected — retrying in %lld s",
-             AUTOPAIR_REJECT_COOLDOWN_US / 1000000LL);
+    ESP_LOGW(TAG, "Pair request rejected by %08X — retrying in %lld s",
+             (unsigned)src_uid, AUTOPAIR_REJECT_COOLDOWN_US / 1000000LL);
     if (_led_cb)    _led_cb(PairLED::TRIPLE_BLINK);
-    if (_result_cb) _result_cb(false, src_mac);
+    if (_result_cb) _result_cb(false, src_uid);
+}
+
+/* ─── Either side: SET_LOCATION (re-address over the air) ─────────────────── */
+
+void AutoPair::onSetLocation(const uint8_t* payload, uint8_t len,
+                             DeviceUid src_uid) {
+    HouseId h; RoomId r; NodeId n;
+    if (!msgDecodeLocation(payload, len, h, r, n)) {
+        ESP_LOGW(TAG, "SET_LOCATION with bad payload (len=%u)", len);
+        return;
+    }
+
+    /* Only our own controller may move us. Without this check any device in
+     * radio range could re-address the whole installation. */
+    lock();
+    bool authorised = _is_controller ||
+                      (_state == PairState::PAIRED && _controller_uid == src_uid);
+    unlock();
+
+    if (!authorised) {
+        ESP_LOGW(TAG, "SET_LOCATION from %08X ignored — not our controller",
+                 (unsigned)src_uid);
+        return;
+    }
+
+    DeviceIdentity::instance().setLocation(h, r, n);
+    ESP_LOGI(TAG, "Re-addressed: house 0x%04X room %u node %u",
+             (unsigned)h, (unsigned)r, (unsigned)n);
 }
 
 /* =============================================================================
@@ -490,7 +729,7 @@ void AutoPair::onPairReject(const uint8_t src_mac[6]) {
  * ========================================================================== */
 
 void AutoPair::sendPairRequest() {
-    /* Payload: [role(1), fw_major(1), name(0-8)] — MSG_PAYLOAD_MAX is 10 */
+    /* Payload: [role(1), fw_major(1), name(0-22)] */
     uint8_t payload[MSG_PAYLOAD_MAX];
     payload[0] = (uint8_t)_role;
     payload[1] = ConfigStore::instance().getU8(ConfigKeys::FW_MAJOR, 1);
@@ -499,14 +738,19 @@ void AutoPair::sendPairRequest() {
     if (name_len > MSG_PAYLOAD_MAX - 2) name_len = MSG_PAYLOAD_MAX - 2;
     memcpy(payload + 2, _name, name_len);
 
-    MessageProtocol::instance().broadcastCommand(CMD_PAIR_REQUEST,
+    MessageProtocol::instance().broadcastCommand(CmdId::PAIR_REQUEST,
                                                  payload, 2 + name_len);
     ESP_LOGD(TAG, "Pair request #%lu sent", (unsigned long)_request_count);
 }
 
-void AutoPair::sendPairResponse(const uint8_t dst_mac[6], bool accept) {
-    MessageProtocol::instance().sendCommand(
-        dst_mac, accept ? CMD_PAIR_ACCEPT : CMD_PAIR_REJECT);
+void AutoPair::sendPairAccept(DeviceUid uid, RoomId room, NodeId node) {
+    uint8_t p[4];
+    msgEncodeLocation(p, DeviceIdentity::instance().house(), room, node);
+    MessageProtocol::instance().sendCommand(uid, CmdId::PAIR_ACCEPT, p, 4);
+}
+
+void AutoPair::sendPairReject(DeviceUid uid) {
+    MessageProtocol::instance().sendCommand(uid, CmdId::PAIR_REJECT);
 }
 
 /* =============================================================================
@@ -517,20 +761,25 @@ void AutoPair::loadDevicePairing() {
     ConfigStore& cfg = ConfigStore::instance();
     if (cfg.getBool(NVS_DEV_PAIRED, false)) {
         size_t len = 6;
-        if (cfg.getBlob(NVS_DEV_CTRL_MAC, _controller_mac, &len) == ESP_OK
+        uint32_t uid = cfg.getU32(NVS_DEV_CTRL_UID, UID_NONE);
+        if (uid != UID_NONE
+            && cfg.getBlob(NVS_DEV_CTRL_MAC, _controller_mac, &len) == ESP_OK
             && len == 6) {
+            _controller_uid = uid;
             _state = PairState::PAIRED;
             return;
         }
-        ESP_LOGW(TAG, "Pairing flag set but MAC blob invalid — resetting");
+        ESP_LOGW(TAG, "Pairing flag set but record invalid — resetting");
         eraseDevicePairing();
     }
+    _controller_uid = UID_NONE;
     _state = PairState::UNPAIRED;
 }
 
 void AutoPair::saveDevicePairing() {
     ConfigStore& cfg = ConfigStore::instance();
     cfg.setBlob(NVS_DEV_CTRL_MAC, _controller_mac, 6);
+    cfg.setU32(NVS_DEV_CTRL_UID, _controller_uid);
     cfg.setBool(NVS_DEV_PAIRED, true);
 }
 
@@ -538,6 +787,7 @@ void AutoPair::eraseDevicePairing() {
     ConfigStore& cfg = ConfigStore::instance();
     cfg.eraseKey(NVS_DEV_PAIRED);
     cfg.eraseKey(NVS_DEV_CTRL_MAC);
+    cfg.eraseKey(NVS_DEV_CTRL_UID);
 }
 
 void AutoPair::loadPairedList() {
@@ -552,8 +802,11 @@ void AutoPair::loadPairedList() {
     if (count > AUTOPAIR_MAX_PAIRED) count = AUTOPAIR_MAX_PAIRED;
 
     for (uint8_t i = 0; i < count; i++) {
+        _paired[i].uid  = recs[i].uid;
         memcpy(_paired[i].mac, recs[i].mac, 6);
         _paired[i].role = (DeviceRole)recs[i].role;
+        _paired[i].room = recs[i].room;
+        _paired[i].node = recs[i].node;
         memcpy(_paired[i].name, recs[i].name, DEVICE_NAME_LEN);
         _paired[i].name[DEVICE_NAME_LEN - 1] = '\0';
     }
@@ -570,8 +823,11 @@ void AutoPair::savePairedList() {
 
     PairedRecord recs[AUTOPAIR_MAX_PAIRED] = {};
     for (uint8_t i = 0; i < _paired_count; i++) {
+        recs[i].uid  = _paired[i].uid;
         memcpy(recs[i].mac, _paired[i].mac, 6);
         recs[i].role = (uint8_t)_paired[i].role;
+        recs[i].room = _paired[i].room;
+        recs[i].node = _paired[i].node;
         memcpy(recs[i].name, _paired[i].name, DEVICE_NAME_LEN);
     }
     cfg.setBlob(NVS_CTRL_DEVICES, recs,
@@ -582,9 +838,9 @@ void AutoPair::savePairedList() {
  * LOCKED HELPERS (caller holds _mutex)
  * ========================================================================== */
 
-int AutoPair::findPendingLocked(const uint8_t mac[6]) const {
+int AutoPair::findPendingLocked(DeviceUid uid) const {
     for (uint8_t i = 0; i < _pending_count; i++) {
-        if (memcmp(_pending[i].mac, mac, 6) == 0) return i;
+        if (_pending[i].uid == uid) return i;
     }
     return -1;
 }
@@ -597,9 +853,9 @@ void AutoPair::removePendingLocked(int index) {
     _pending_count--;
 }
 
-int AutoPair::findPairedLocked(const uint8_t mac[6]) const {
+int AutoPair::findPairedLocked(DeviceUid uid) const {
     for (uint8_t i = 0; i < _paired_count; i++) {
-        if (memcmp(_paired[i].mac, mac, 6) == 0) return i;
+        if (_paired[i].uid == uid) return i;
     }
     return -1;
 }
