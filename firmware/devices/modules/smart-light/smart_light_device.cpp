@@ -59,7 +59,7 @@ bool SmartLightDevice::init() {
     }
 
     ESP_LOGI(TAG, "Initialized: %d SK6812 RGBW LEDs on GPIO %d",
-             _strip.getNumLeds(), (int)_strip.getNumLeds());
+             _strip.getNumLeds(), (int)_strip.getPin());
 
     _strip.clear();
     _strip.show();
