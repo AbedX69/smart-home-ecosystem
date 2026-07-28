@@ -16,4 +16,4 @@ set(EXTRA_COMPONENT_DIRS
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(test_smart_light)
+project(smart_light_strip)

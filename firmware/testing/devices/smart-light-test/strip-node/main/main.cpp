@@ -155,7 +155,10 @@ static void logFirmwareIdentity(void) {
     const esp_partition_t* running = esp_ota_get_running_partition();
     const esp_app_desc_t*  desc    = esp_app_get_description();
     ESP_LOGI(TAG, "══════════════════════════════════════════");
-    ESP_LOGI(TAG, "  FW v%s   built %s %s", desc->version, desc->date, desc->time);
+    ESP_LOGI(TAG, "  %s  v%s  sha %02x%02x%02x%02x",
+             desc->project_name, desc->version,
+             desc->app_elf_sha256[0], desc->app_elf_sha256[1],
+             desc->app_elf_sha256[2], desc->app_elf_sha256[3]);
     ESP_LOGI(TAG, "  Slot: %s @ 0x%06lX  (%lu KB)",
              running->label,
              (unsigned long)running->address,
@@ -181,7 +184,6 @@ static void logDeviceIdentity(void) {
 /* ─── app_main ────────────────────────────────────────────────────────────── */
 
 extern "C" void app_main(void) {
-    logFirmwareIdentity();
 
     /* NVS first — DeviceIdentity and AutoPair both persist here. */
     ConfigStore::instance().begin();
@@ -270,6 +272,7 @@ extern "C" void app_main(void) {
     pair.begin(DeviceRole::LIGHT, "Strip 1");
 
     logDeviceIdentity();
+    logFirmwareIdentity();
 
     while (true) {
         pair.update();
