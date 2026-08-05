@@ -3594,12 +3594,7 @@ Strip grew +4,866 B over v2. Six files rewritten, **zero compile errors on first
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
-##############################################################################################################################################################################################################################################################################################################################################################################################################################
-##############################################################################################################################################################################################################################################################################################################################################################################################################################
-##############################################################################################################################################################################################################################################################################################################################################################################################################################
-##############################################################################################################################################################################################################################################################################################################################################################################################################################
-##############################################################################################################################################################################################################################################################################################################################################################################################################################
-##################################################################################################################################################################################################################
+
 
 # Dev Log � 27/07/2026 (Mon, session 2)
 
@@ -3692,7 +3687,8 @@ uptime counter ran straight through it. Worth doing before the strip goes on a c
 5. **`Select-String` is case-insensitive by default.** A count of `_reloc` returned 33
    instead of 27 because `AUTOPAIR_MAX_RELOCATES` matched too. Same family as the
    `-like '??*'` trap: the tool's default was not the assumed one.
-6. **Line endings: this repo is LF.** `\\
+6. **Line endings: this repo is LF.** `\
+\
 ` in a PowerShell `.Replace()` silently
    injects CRLF into an LF file. Two lines were mixed before being caught. Here-strings pasted
    through the console arrive as LF, which is why only the explicit escapes were affected.
@@ -3734,3 +3730,307 @@ Untouched: `message_protocol.*`, strip `main.cpp`, all `CMakeLists.txt`.
 - [ ] GC9A01: hoist `spi_bus_initialize` into a shared display-bus module
 - [ ] TouchSensor reports `initial state: TOUCHED` at boot on both pads � phantom touch
 - [ ] Encoder: guard `gpio_install_isr_service` already-installed
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Dev Log - 05/08/2026 (Wed)
+
+Phase 2 continued. The OTA core/HTTP split was already on disk from the previous session but
+uncommitted, and the `ota-test` caller was half-ported. This session finished the port,
+committed the split, and then spent most of its time on hardware verification - which is where
+the useful findings came from.
+
+Outcome: the sink API, boot flip, validation timer, manual rollback, and automatic rollback are
+all verified on real silicon, on both chips, on the partition layout the strip will actually
+ship with.
+
+---
+
+## Where things stood
+
+`git status` at session start showed the split had landed but never been committed:
+`ota_manager.{h,cpp}` modified, `system/ota_http/` untracked. A grep across the OTA files
+confirmed `ota-test/main/main.cpp` was the only remaining caller of the old member API.
+
+Lesson worth repeating: the dev log and the commit history both lagged behind disk, because
+edits happen via PowerShell and get committed later. Grepping the files was the only
+authoritative answer. Neither doc nor git could have told us.
+
+---
+
+## The caller port
+
+`main.cpp` had nine member calls across three build modes:
+`registerWebUI` / `registerUploadHandler` / `registerStatusHandler` (x3 modes),
+plus `setUpdateURL` and `checkForUpdate`. All became `ota_http_*` free functions.
+`ota_http` added to `EXTRA_COMPONENT_DIRS` and to `main`'s `REQUIRES`.
+
+The `ota_http` component's own `CMakeLists.txt` already listed `esp_http_server` and
+`esp_http_client` - checked rather than assumed, which saved a round trip.
+
+Both `esp32d` and `s3_wroom` built clean. Worth noting the build succeeding is stronger
+evidence than watching `ota_http.cpp` compile: if the component had not been found, the
+`ota_http_*` calls would have failed at link with undefined references.
+
+---
+
+## PROJECT_VER does not work as a build flag
+
+Previous entry, takeaway 7, called for a version source that survives incremental builds.
+This session found the answer and also found that the existing mechanism was never working.
+
+`platformio.ini` carried `-DPROJECT_VER=\"1.2.0\"` in `build_flags`, and the file's own
+comments documented that as the way to set the version. It is not. `-D` puts the value on the
+compiler command line; `esp_app_desc` is populated by CMake, which reads `PROJECT_VER` set
+before `project()`, else `version.txt`, else `git describe`. The board was reporting
+`cc0876f-dirty` - the git-describe fallthrough - and had been all along.
+
+Fix: `set(PROJECT_VER "1.3.0")` immediately before `project(ota-test)` in `CMakeLists.txt`,
+and remove the `-D` flag. Leaving both in place produced
+`warning: "PROJECT_VER" redefined` with no way to tell from the log which one won.
+
+Verification that does not rely on inference: `esp_app_desc` sits at a fixed offset after the
+image header, with the version string at byte 0x30 of the `.bin`. Reading it straight out of
+the artifact settles the question. Flash size cannot - the field is a fixed 32 bytes, so
+`1.2.0`, `1.3.0` and `cc0876f-dirty` all produce identical image sizes.
+
+The git-describe string is arguably the better source for the real hub and strip, since it ties
+an image to a commit. Deferred; not a Phase 2 decision.
+
+---
+
+## Sink API verified on the S3
+
+Sequence on COM4 (S3, 16MB, MAC `b8:f8:62:e0:a0:74`), 828096-byte images:
+
+    factory (cc0876f-dirty)  ->  ota_0 (1.3.0)  ->  ota_1 (1.4.0)
+
+Every stage of the sink appeared in the log in order: `Write opened on ota_0 @ 0x110000`,
+progress to 100%, `Staged image: ota-test v1.3.0` (finishWrite reading `esp_app_desc` back out
+of the staged slot), `Image accepted: ... Reboot when ready.`
+
+That last line matters: the sink does **not** reboot. `OTAHttp` did, two seconds later. That is
+exactly the separation the split was for, working on hardware. An ESP-NOW transfer will be able
+to ACK its final chunk before rebooting.
+
+`Pending: YES` on the new boot, then `Firmware validated! Rollback cancelled.` at 836ms.
+
+---
+
+## The factory-partition red herring
+
+Manual rollback from ota_1 on the S3 landed on **factory**, not ota_0. The bootloader said
+`Defaulting to factory image` outright.
+
+The initial read was that otadata had no valid OTA slot to fall back to, and that this was a
+real hole - because neither `partitions_4mb.csv` nor `partitions_16mb.csv` has a factory
+partition. Both are two-slot layouts. If rollback needed factory, the real devices had no net.
+
+That read was wrong, and the reason it was wrong is the important part:
+**ota-test was not building against the project's partition tables.**
+`board_build.partitions = partitions_two_ota.csv` resolved to PlatformIO's built-in table,
+which *does* have a factory partition. The test was run on a layout that does not match the
+target, so its result said nothing about the target.
+
+Fix: per-env tables pointing at `system/partitions/`, `partitions_16mb.csv` under
+`[env:s3_wroom]` and `partitions_4mb.csv` under `[env:c6_seeed]`. The other envs now have no
+table and will fail loudly rather than silently falling back to a factory-containing default.
+
+---
+
+## Rollback verified on the strip's real layout
+
+Rerun on COM7 (C6, 4MB, base MAC `b4:3a:45:8a:81:74`) with `partitions_4mb.csv`. Slots are
+labelled `app0` / `app1` (the CSV name; the subtype is what the bootloader reads), 1856KB each,
+no factory. 923456-byte images.
+
+Manual rollback: `app1 (1.5.0)` -> `app0 (1.4.0)`. Correct. The S3 result was an artifact.
+
+Automatic rollback, the one that actually matters for a ceiling-mounted node - built with
+`-DOTA_TEST_ROLLBACK`, version `9.9.9` so it could not be confused with anything, uploaded, then
+left alone:
+
+    W (10958) Self-tests not calling validate() - rollback will happen in ~20s
+    I (25958) Running... pending=YES
+    E (30618) OTAManager: Validation timeout expired! Auto-rolling back...
+    I (30748) esp_ota_ops: Rollback to previously worked partition.
+    ->  Loaded app from partition at offset 0x10000, App version: 1.4.0
+
+Timer fired 618ms past a 30s deadline. Nobody touched anything. That is the un-brickable
+guarantee demonstrated rather than assumed.
+
+---
+
+## Cross-architecture rejection (unplanned)
+
+Both boards hardcode the same softAP SSID, so with both powered it is ambiguous which one the
+browser is talking to. A C6 image got uploaded to the S3 by accident. The sink rejected it:
+`Upload failed: Image validation failed`, and the S3 kept running its existing image. The
+boot flip never happened.
+
+`esp_ota_end()`'s chip-ID check catches architecture mismatch. Not a substitute for the planned
+`DeviceRole` check in the offer handshake - that one runs before any bytes transfer, this one
+after a full 828KB upload - but useful to know the floor exists.
+
+---
+
+## Credentials leak
+
+`platformio.ini` carried a live WiFi SSID and password in `build_flags`, uncommented, tracked,
+and already pushed to a public repo in two commits (`4e2daf2`, `59e8129`).
+
+History rewriting was not the fix. GitHub keeps orphaned objects reachable by SHA after a
+force-push, forks and clones keep their own copies, and anything that scraped the repo already
+has it. The credential was rotated instead, which makes the leaked string worthless. That is
+the only action that fully closes it.
+
+Ongoing pattern: `secrets.ini`, gitignored, pulled in via `extra_configs` in `platformio.ini`.
+Placeholders stay in the tracked file. Note `build_flags` is replaced wholesale rather than
+merged, so `secrets.ini` must repeat every flag it wants, including the mode selector.
+
+---
+
+## Key takeaways
+
+1. **A test on the wrong configuration is worse than no test.** The S3 rollback result looked
+   like a design flaw for twenty minutes. It was a partition table that did not match the
+   target. Verify the test rig matches the thing being tested before believing the result.
+2. **`-DPROJECT_VER` never worked, and the file documented it as if it did.** A wrong comment
+   is more expensive than a missing one. Both were corrected.
+3. **Read the artifact, not the build log.** Version strings live at a fixed offset in the
+   `.bin`. Inferring from flash size delta cannot work for fixed-width fields.
+4. **`git status` answers "did that edit land" better than memory or the dev log.** Both lag
+   disk in this workflow. Grep is authoritative.
+5. **Rotate leaked credentials; do not try to erase them.** Public repo means assume scraped.
+   Rewriting history is theatre once it is pushed.
+6. **Line endings, again.** This repo is LF. A `.Replace()` with a hardcoded CRLF is a silent
+   no-op - it happened once this session, on the `extra_configs` insert, and cost a round trip.
+   Detect the newline from the file content rather than assuming.
+7. **Two boards, one SSID is a foot-gun.** Uploading C6 firmware to an S3 was only caught
+   because the sink rejected it. Bench setups need distinguishable identifiers.
+8. **C6 RSSI at bench distance is -87 to -93 dBm**, with the link falling back to 1Mbps and the
+   PC repeatedly dropping and rejoining. WiFi association churn is irrelevant to ESP-NOW, which
+   needs no association - but weak RF is weak RF, and this is worth remembering when the bulk
+   plane starts losing chunks. The XIAO C6 has a U.FL connector; whether the onboard antenna is
+   selected has not been checked.
+
+---
+
+## Files changed
+
+- `system/ota/ota_manager.{h,cpp}`, `system/ota/CMakeLists.txt` - transport-neutral sink, no
+  HTTP dependency
+- `system/ota_http/{ota_http.h,ota_http.cpp,CMakeLists.txt}` - new component, HTTP as an
+  ordinary consumer of the sink
+- `testing/wireless/ota-test/main/main.cpp` - member calls to `ota_http_*` free functions
+- `testing/wireless/ota-test/main/CMakeLists.txt` - `REQUIRES ota ota_http`
+- `testing/wireless/ota-test/CMakeLists.txt` - `ota_http` in `EXTRA_COMPONENT_DIRS`,
+  `set(PROJECT_VER)` before `project()`
+- `testing/wireless/ota-test/platformio.ini` - per-env partition tables, credential
+  placeholders, `extra_configs`, corrected comments
+- `testing/devices/smart-light-test/{hub,strip-node}/sdkconfig.defaults` -
+  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`
+- `.gitignore` - `secrets.ini`
+
+Commits: `0f59be9`, `cac00eb`, `0065db3`, `85331b6`, `8b451de`.
+
+---
+
+## Next steps
+
+- [ ] **ESP-NOW bulk plane** - wire format first: chunk header layout, bitmap encoding,
+      gap-list format, where CRC32 lives. 230-byte chunks over raw `esp_now_send`, no per-chunk
+      ACK, resend driven from the control plane. ~4000 chunks for a 923KB image.
+- [ ] Role check in the OTA offer handshake - `DeviceRole` byte compared before any bytes
+      transfer, identity from UID + registry lookup
+- [ ] Hub-side policy: a node that rolls back and is then offered the same image will loop.
+      Consider tracking "this UID rejected this version" - belongs in the bulk-plane design
+- [ ] Strip state persistence in NVS + `power_on_behavior` byte (debounce writes ~10 s)
+- [ ] Pairing recovery: re-open for pairing if the hub is unheard for ~10 min, staying lit
+- [ ] Power-cycle the strip and confirm its NVS still reads room 2 (carried forward, still open)
+- [ ] `processPairMessage()` returns void, so an unauthorised `SET_LOCATION` is dropped and
+      still ACKs OK. "ACKed" means received, not applied. Needs a return value.
+- [ ] Reset `PROJECT_VER` in `ota-test/CMakeLists.txt` - currently left at `9.9.9`
+- [ ] Reflash `smart_light_hub` to COM4 and `smart_light_strip` to COM7; both boards currently
+      carry ota-test
+- [ ] Check whether the XIAO C6's RF switch selects the onboard antenna (see takeaway 8)
+- [ ] Two PlatformIO cores installed (6.1.18 and 6.1.19) - a source of build inconsistency
+- [ ] GC9A01: hoist `spi_bus_initialize` into a shared display-bus module
+- [ ] TouchSensor reports `initial state: TOUCHED` at boot on both pads - phantom touch
+- [ ] Encoder: guard `gpio_install_isr_service` already-installed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##############################################################################################################################################################################################################################################################################################################################################################################################################################
+##################################################################################################################################################################################################################
