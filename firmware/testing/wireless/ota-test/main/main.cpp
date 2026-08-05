@@ -31,6 +31,7 @@
 #include "esp_event.h"
 
 #include "ota_manager.h"
+#include "ota_http.h"
 
 static const char* TAG = "OTATest";
 
@@ -236,9 +237,9 @@ extern "C" void app_main(void) {
 
     httpd_handle_t server = start_http_server();
     if (server) {
-        ota.registerWebUI(server);
-        ota.registerUploadHandler(server);
-        ota.registerStatusHandler(server);
+        ota_http_register_web_ui(server);
+        ota_http_register_upload(server);
+        ota_http_register_status(server);
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "  Browse to: http://192.168.4.1/ota");
         ESP_LOGI(TAG, "");
@@ -259,21 +260,21 @@ extern "C" void app_main(void) {
     /* Also start HTTP server for status/web UI */
     httpd_handle_t server = start_http_server();
     if (server) {
-        ota.registerWebUI(server);
-        ota.registerUploadHandler(server);
-        ota.registerStatusHandler(server);
+        ota_http_register_web_ui(server);
+        ota_http_register_upload(server);
+        ota_http_register_status(server);
     }
 
     /* Validate current firmware */
     ota.validate();
 
     /* Set update server URL */
-    ota.setUpdateURL(OTA_UPDATE_URL);
+    ota_http_set_update_url(OTA_UPDATE_URL);
 
     /* Check for update every 60 seconds */
     while (true) {
         ESP_LOGI(TAG, "Checking for updates...");
-        ota.checkForUpdate(true);  // auto_update = true
+        ota_http_check_for_update(true);  // auto_update = true
 
         vTaskDelay(pdMS_TO_TICKS(60000));
     }
@@ -284,9 +285,9 @@ extern "C" void app_main(void) {
 
     httpd_handle_t server = start_http_server();
     if (server) {
-        ota.registerWebUI(server);
-        ota.registerUploadHandler(server);
-        ota.registerStatusHandler(server);
+        ota_http_register_web_ui(server);
+        ota_http_register_upload(server);
+        ota_http_register_status(server);
     }
 
     if (ota.isPendingValidation()) {
