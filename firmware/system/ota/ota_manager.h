@@ -3,20 +3,22 @@
  * FILE:        ota_manager.h
  * AUTHOR:      AbedX69
  * CREATED:     2026-02-14
- * VERSION:     1.0.0
+ * UPDATED:     2026-07-28
+ * VERSION:     2.0.0
  * LICENSE:     MIT
  * PLATFORM:    ESP32 / ESP32-S3 / ESP32-C6 (ESP-IDF v5.x)
  * =============================================================================
  * 
  * OTA Manager - Over-The-Air firmware update management.
  * 
- * Provides a complete OTA solution:
- *   - Web UI with drag & drop firmware upload
- *   - Semantic version tracking (stored in NVS)
- *   - Pull-based updates from HTTP server (version check + download)
- *   - Push-based updates via HTTP POST upload
+ * Transport-neutral update engine:
+ *   - Sink API (beginWrite / writeChunk / finishWrite / abortWrite)
  *   - Rollback protection with configurable validation timeout
+ *   - Semantic version tracking
  *   - Partition info reporting
+ * 
+ * The HTTP half - web UI, drag & drop upload, pull-from-URL - lives in the
+ * separate `ota_http` component and is an ordinary consumer of the sink.
  * 
  * =============================================================================
  * BEGINNER'S GUIDE: OTA UPDATES
@@ -95,15 +97,73 @@
  * 
  * 
  * =============================================================================
+ * WHAT CHANGED IN v2.0.0
+ * =============================================================================
+ * 
+ * v1.0.0 was HTTP-only: the upload handler owned the esp_ota_* calls, and the
+ * public API took httpd_handle_t, which dragged esp_http_server into every
+ * consumer's build - including leaf nodes that will never serve a web page.
+ * 
+ * v2.0.0 splits that in two:
+ * 
+ *   ota_manager  (this file)  lifecycle, rollback, validation, and the SINK.
+ *                             Depends only on app_update / esp_partition /
+ *                             esp_timer / freertos. This is what a strip node
+ *                             on a ceiling requires.
+ * 
+ *   ota_http     (separate)   HTTP upload handler, web UI, pull-from-URL.
+ *                             Hub only.
+ * 
+ * The ESP-NOW bulk plane becomes a third consumer of the same sink. All three
+ * transports share one esp_ota engine, so there is exactly one place where a
+ * write can go wrong.
+ * 
+ * 
+ * THE SINK:
+ * ~~~~~~~~~
+ *     beginWrite(total)     esp_ota_begin on the next slot. Erases it.
+ *     writeChunk(buf, len)  esp_ota_write. Call as many times as needed.
+ *     finishWrite()         esp_ota_end + set_boot_partition. No reboot.
+ *     abortWrite()          esp_ota_abort. Safe to call at any point.
+ * 
+ * finishWrite() deliberately does NOT reboot. The caller decides when - an
+ * HTTP handler wants to answer the request first; an ESP-NOW transfer wants
+ * to ACK the final chunk first. Rebooting inside the sink would cut both off.
+ * 
+ * 
+ * TARGET CHECKING - deliberately NOT here:
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The sink does not inspect what it is writing. Refusing an image meant for a
+ * different kind of device is the job of the OTA offer handshake, which
+ * compares DeviceRole (core_types.h) BEFORE any bytes transfer. Cheaper than
+ * discovering it after a multi-minute radio transfer, and it matches on a role
+ * byte rather than on any name - so build names and user-facing device names
+ * can both change freely without ever breaking an update.
+ * 
+ * 
+ * REQUIRES CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y:
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Without it the running partition never reports ESP_OTA_IMG_PENDING_VERIFY,
+ * the timer never arms, validate() is a no-op, and this whole mechanism
+ * silently does nothing while looking correct. Set in sdkconfig.defaults for
+ * both smart-light apps as of 28/07/2026.
+ * 
+ * 
+ * WHAT validate() SHOULD MEAN:
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Not "do the LEDs work" but "can I still be reached and updated". A strip
+ * with dead LEDs and a live radio is fixable from the couch. A strip with
+ * perfect LEDs and a broken receive path is a ladder. Gate validate() on
+ * proof of round-trip comms, not on peripherals.
+ * 
+ * =============================================================================
  * USAGE EXAMPLES
  * =============================================================================
  * 
- * MINIMAL (web upload only):
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~
- *     OTAManager& ota = OTAManager::instance();
- *     ota.begin();
- *     ota.registerUploadHandler(http_server_handle);
- *     ota.registerWebUI(http_server_handle);
+ * MINIMAL (web upload only) - hub, needs the ota_http component:
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *     OTAManager::instance().begin();
+ *     ota_http_register_all(http_server_handle);
  *     // → Browse to http://device.local/ota
  * 
  * 
@@ -118,10 +178,34 @@
  *     // If validate() isn't called within 60s → auto rollback
  * 
  * 
- * AUTO-UPDATE FROM SERVER:
- * ~~~~~~~~~~~~~~~~~~~~~~~~
- *     ota.setUpdateURL("http://192.168.1.100:8080/firmware");
- *     ota.checkForUpdate();  // Checks version, downloads if newer
+ * AUTO-UPDATE FROM SERVER (hub, ota_http component):
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *     ota_http_set_update_url("http://192.168.1.100:8080/firmware");
+ *     ota_http_check_for_update();  // Checks version, downloads if newer
+ * 
+ * 
+ * LEAF NODE (strip) - core component only, no HTTP:
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *     OTAManager& ota = OTAManager::instance();
+ *     ota.begin(60);                    // arms rollback timer if pending
+ * 
+ *     ... bring up radio, protocol, pairing ...
+ * 
+ *     if (ota.isPendingValidation()) {
+ *         // send a reliable PING to the paired controller; call
+ *         // ota.validate() from the delivery callback when it is ACKed
+ *     }
+ * 
+ * 
+ * ANY TRANSPORT (HTTP, ESP-NOW, LoRa later):
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *     ota.beginWrite(image_size);
+ *     while (more) ota.writeChunk(buf, n);
+ *     ota.finishWrite();
+ *     esp_restart();                    // caller's choice, when ready
+ * 
+ *     // on any error:
+ *     ota.abortWrite();
  * 
  * =============================================================================
  */
@@ -130,6 +214,7 @@
 #define OTA_MANAGER_H
 
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <functional>
 
@@ -139,17 +224,11 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_app_desc.h"
-#include "esp_http_server.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 
 /* ─── Constants ──────────────────────────────────────────────────────────── */
 #define OTA_MAX_VERSION_LEN     32
-#define OTA_MAX_URL_LEN         256
-#define OTA_NVS_NAMESPACE       "ota_mgr"
-#define OTA_RECV_BUF_SIZE       4096
 #define OTA_DEFAULT_TIMEOUT_S   60      ///< Default rollback timeout in seconds
 
 /* ─── Event Types ────────────────────────────────────────────────────────── */
@@ -221,8 +300,10 @@ public:
     /**
      * @brief Initialize OTA manager.
      * 
-     * Reads current version from NVS, checks rollback state,
-     * starts validation timer if firmware is pending verify.
+     * Reads the running version from esp_app_desc, checks rollback state,
+     * starts the validation timer if firmware is pending verify.
+     * 
+     * Call early in app_main. Safe to call before the radio exists.
      * 
      * @param validation_timeout_s  Seconds before auto-rollback (0 = disabled)
      * @return ESP_OK on success
@@ -235,9 +316,17 @@ public:
      * @brief Get current firmware version string.
      * 
      * Returns the version from esp_app_desc (set at compile time via
-     * PROJECT_VER in CMakeLists.txt or build flags).
+     * CONFIG_APP_PROJECT_VER in sdkconfig.defaults).
      */
     const char* getVersion() const;
+
+    /**
+     * @brief Get the running firmware's project name, from esp_app_desc.
+     * 
+     * Set by project() in the app's top-level CMakeLists.txt.
+     * For logging and offer handshakes - NOT used as a target check.
+     */
+    const char* getProjectName() const;
 
     /**
      * @brief Parse a version string into SemVer components.
@@ -254,65 +343,42 @@ public:
      */
     static void versionToStr(const SemVer& ver, char* buf);
 
-    /* ─── Firmware Upload (Push) ───────────────────────────────────────── */
+    /* ─── The Sink - used by every transport ───────────────────────────── */
 
     /**
-     * @brief Register HTTP POST handler for firmware upload.
+     * @brief Open the next OTA slot for writing. Erases it.
      * 
-     * Accepts binary firmware at POST /api/ota/upload
-     * Streams directly to flash (no full-image buffering needed).
-     * 
-     * @param server  HTTP server handle (from WiFiHttpServer or httpd_start)
-     * @return ESP_OK on success
+     * @param total_size  Expected image size, or 0 if unknown. Passing the
+     *                    real size lets esp_ota_begin erase only what it
+     *                    needs, which is much faster than erasing the slot.
+     * @return ESP_ERR_INVALID_STATE if a write is already open.
      */
-    esp_err_t registerUploadHandler(httpd_handle_t server);
+    esp_err_t beginWrite(size_t total_size = 0);
 
     /**
-     * @brief Register the web UI page at GET /ota
-     * 
-     * Serves an embedded HTML page with:
-     *   - Drag & drop firmware upload
-     *   - Progress bar
-     *   - Current version display
-     *   - Partition info
-     *   - Rollback button
-     * 
-     * @param server  HTTP server handle
-     * @return ESP_OK on success
+     * @brief Append to the open slot. Must follow a successful beginWrite.
      */
-    esp_err_t registerWebUI(httpd_handle_t server);
-
-    /* ─── Firmware Download (Pull) ─────────────────────────────────────── */
+    esp_err_t writeChunk(const void* data, size_t len);
 
     /**
-     * @brief Set the URL for checking/downloading updates.
+     * @brief Close the image, verify it, set it as the boot partition.
      * 
-     * The URL should point to a directory with:
-     *   - manifest.json: { "version": "x.y.z", "file": "firmware.bin" }
-     *   - firmware.bin: the actual firmware binary
+     * esp_ota_end() rejects a truncated or corrupt image here, so a failed
+     * return means the slot was NOT made bootable - the running image is
+     * untouched and still bootable.
      * 
-     * @param base_url  Base URL (e.g., "http://192.168.1.100:8080/firmware")
+     * Does NOT reboot. Caller decides when.
      */
-    void setUpdateURL(const char* base_url);
+    esp_err_t finishWrite();
 
     /**
-     * @brief Check if an update is available on the server.
-     * 
-     * Downloads manifest.json, compares version with current.
-     * Reports result via OTAEvent::VERSION_CHECK callback.
-     * 
-     * @param auto_update  If true and update available, download immediately
-     * @return ESP_OK if check succeeded (doesn't mean update is available)
+     * @brief Discard the open write. Safe to call when none is open.
      */
-    esp_err_t checkForUpdate(bool auto_update = false);
+    void abortWrite();
 
-    /**
-     * @brief Download and flash firmware from URL.
-     * 
-     * @param url  Direct URL to .bin file
-     * @return ESP_OK on success (device will reboot)
-     */
-    esp_err_t updateFromURL(const char* url);
+    bool     isWriteInProgress() const;
+    uint32_t bytesWritten() const;
+    uint32_t expectedSize() const;
 
     /* ─── Rollback & Validation ────────────────────────────────────────── */
 
@@ -320,7 +386,8 @@ public:
      * @brief Mark current firmware as valid (cancel rollback).
      * 
      * MUST be called after successful boot to prevent auto-rollback.
-     * Call this after your application passes self-tests.
+     * Call this only once the device has proven it is still reachable -
+     * see "WHAT validate() SHOULD MEAN" at the top of this file.
      * 
      * @return ESP_OK on success
      */
@@ -348,39 +415,36 @@ public:
 
     void setEventCallback(OTAEventCb cb);
 
-    /* ─── Status API (for web UI) ──────────────────────────────────────── */
-
     /**
-     * @brief Register JSON status endpoint at GET /api/ota/status
+     * @brief Emit an event to the registered callback.
      * 
-     * Returns: { "version", "partition", "pending_verify",
-     *            "rollback_possible", "uptime" }
+     * Public so ota_http (and later the ESP-NOW plane) can report
+     * transport-level outcomes through the same channel as the sink,
+     * rather than each transport inventing its own reporting path.
      */
-    esp_err_t registerStatusHandler(httpd_handle_t server);
+    void emitEvent(OTAEvent event, const OTAEventInfo* info = nullptr);
 
 private:
     OTAManager();
     ~OTAManager();
 
-    /* HTTP handlers */
-    static esp_err_t uploadHandler(httpd_req_t* req);
-    static esp_err_t webUIHandler(httpd_req_t* req);
-    static esp_err_t statusHandler(httpd_req_t* req);
-    static esp_err_t rollbackHandler(httpd_req_t* req);
-
     /* Validation timer */
     static void validationTimerCb(TimerHandle_t timer);
 
-    void emitEvent(OTAEvent event, const OTAEventInfo* info = nullptr);
-
-    /* State */
+    /* Lifecycle state */
     bool            _initialized;
     char            _version[OTA_MAX_VERSION_LEN];
-    char            _update_url[OTA_MAX_URL_LEN];
+    char            _project_name[OTA_MAX_VERSION_LEN];
     uint32_t        _validation_timeout_s;
     bool            _pending_verify;
     TimerHandle_t   _validation_timer;
-    bool            _update_in_progress;
+
+    /* Sink state */
+    esp_ota_handle_t        _write_handle;
+    const esp_partition_t*  _write_partition;
+    uint32_t                _bytes_written;
+    uint32_t                _expected_size;
+    bool                    _write_open;
 
     OTAEventCb      _event_cb;
 };
