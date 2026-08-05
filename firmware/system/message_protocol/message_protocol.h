@@ -210,7 +210,15 @@ enum class CmdId : uint8_t {
     SET_LOCATION    = 0x74,     ///< Re-address a device over the air.
                                 ///< Payload: [house_lo, house_hi, room, node]
 
-    /* 0x80–0x8F reserved for OTA control (Phase 2) */
+    /* 0x80–0x8F assigned below; 0x85-0x8F still free */
+
+    /* -- OTA control (ota_bulk rides on these) -- */
+    OTA_OFFER       = 0x80,     ///< Hub -> device. Payload: OtaOfferPayload.
+                                ///< Its ACK is the accept/reject.
+    OTA_PASS_END    = 0x81,     ///< Hub -> device. Payload: OtaPassEndPayload
+    OTA_GAP_REPORT  = 0x82,     ///< Device -> hub. Payload: OtaGapReportPayload
+    OTA_COMPLETE    = 0x83,     ///< Device -> hub. Payload: OtaCompletePayload
+    OTA_ABORT       = 0x84,     ///< Either way.    Payload: OtaAbortPayload
 
     /* ── Custom ─────────── */
     CUSTOM_0        = 0xF0,

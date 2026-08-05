@@ -767,6 +767,11 @@ const char* MessageProtocol::cmdName(CmdId cmd) {
         case CmdId::PAIR_REJECT:     return "PAIR_REJECT";
         case CmdId::PAIR_UNPAIR:     return "PAIR_UNPAIR";
         case CmdId::SET_LOCATION:    return "SET_LOCATION";
+        case CmdId::OTA_OFFER:       return "OTA_OFFER";
+        case CmdId::OTA_PASS_END:    return "OTA_PASS_END";
+        case CmdId::OTA_GAP_REPORT:  return "OTA_GAPS";
+        case CmdId::OTA_COMPLETE:    return "OTA_DONE";
+        case CmdId::OTA_ABORT:       return "OTA_ABORT";
         default:                     return "CUSTOM";
     }
 }
