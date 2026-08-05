@@ -8,6 +8,8 @@ set(EXTRA_COMPONENT_DIRS
     "../../../../devices/modules/smart-light"
     "../../../../wireless/esp_now"
     "../../../../system/message_protocol"
+    "../../../../system/ota"
+    "../../../../system/ota_bulk"
     "../../../../system/auto_pair"
     "../../../../system/config_store"
     "../../../../system/core_types"
