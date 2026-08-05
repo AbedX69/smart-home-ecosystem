@@ -13,6 +13,7 @@
  */
 
 #include "ota_manager.h"
+#include "esp_crc.h"
 
 static const char* TAG = "OTAManager";
 
@@ -35,6 +36,7 @@ OTAManager::OTAManager()
     , _bytes_written(0)
     , _expected_size(0)
     , _write_open(false)
+    , _write_mode(WriteMode::NONE)
     , _event_cb(nullptr)
 {
     memset(_version, 0, sizeof(_version));
@@ -208,6 +210,7 @@ esp_err_t OTAManager::beginWrite(size_t total_size) {
     _write_open     = true;
     _bytes_written  = 0;
     _expected_size  = (uint32_t)total_size;
+    _write_mode     = WriteMode::NONE;
 
     if (total_size > 0) {
         ESP_LOGI(TAG, "Write opened on %s @ 0x%06lX, expecting %lu bytes",
@@ -230,6 +233,12 @@ esp_err_t OTAManager::beginWrite(size_t total_size) {
 esp_err_t OTAManager::writeChunk(const void* data, size_t len) {
     if (!_write_open)        return ESP_ERR_INVALID_STATE;
     if (!data || len == 0)   return ESP_ERR_INVALID_ARG;
+
+    if (_write_mode == WriteMode::OFFSET) {
+        ESP_LOGE(TAG, "writeChunk after writeChunkAt - refusing to mix");
+        return ESP_ERR_INVALID_STATE;
+    }
+    _write_mode = WriteMode::SEQUENTIAL;
 
     esp_err_t err = esp_ota_write(_write_handle, data, len);
     if (err != ESP_OK) {
@@ -293,6 +302,7 @@ esp_err_t OTAManager::finishWrite() {
     _write_open      = false;
     _write_handle    = 0;
     _write_partition = nullptr;
+    _write_mode      = WriteMode::NONE;
 
     if (err != ESP_OK) {
         /* Image rejected: bad magic, bad checksum, truncated, or failing
@@ -342,11 +352,87 @@ void OTAManager::abortWrite() {
     _write_partition = nullptr;
     _bytes_written   = 0;
     _expected_size   = 0;
+    _write_mode      = WriteMode::NONE;
 }
 
 bool     OTAManager::isWriteInProgress() const { return _write_open; }
 uint32_t OTAManager::bytesWritten() const      { return _bytes_written; }
 uint32_t OTAManager::expectedSize() const      { return _expected_size; }
+
+
+esp_err_t OTAManager::writeChunkAt(const void* data, size_t len, uint32_t offset) {
+    if (!_write_open)        return ESP_ERR_INVALID_STATE;
+    if (!data || len == 0)   return ESP_ERR_INVALID_ARG;
+
+    if (_write_mode == WriteMode::SEQUENTIAL) {
+        ESP_LOGE(TAG, "writeChunkAt after writeChunk - refusing to mix");
+        return ESP_ERR_INVALID_STATE;
+    }
+    _write_mode = WriteMode::OFFSET;
+
+    if (_expected_size > 0 && (offset + (uint32_t)len) > _expected_size) {
+        ESP_LOGE(TAG, "chunk at %lu +%u overruns image of %lu",
+                 (unsigned long)offset, (unsigned)len,
+                 (unsigned long)_expected_size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t err = esp_ota_write_with_offset(_write_handle, data, len, offset);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_write_with_offset failed at %lu: %s",
+                 (unsigned long)offset, esp_err_to_name(err));
+
+        OTAEventInfo info = {};
+        info.bytes_written = _bytes_written;
+        info.total_size    = _expected_size;
+        snprintf(info.error_msg, sizeof(info.error_msg),
+                 "offset write failed at %lu: %s",
+                 (unsigned long)offset, esp_err_to_name(err));
+        emitEvent(OTAEvent::UPDATE_FAILED, &info);
+
+        abortWrite();
+        return err;
+    }
+
+    _bytes_written += (uint32_t)len;
+
+    /* No PROGRESS event. Out-of-order arrival makes _bytes_written a count,
+     * not a position, and the bulk plane reports progress from its bitmap. */
+    return ESP_OK;
+}
+
+
+esp_err_t OTAManager::verifyCrc32(uint32_t expected, uint32_t len) {
+    if (!_write_open || !_write_partition)        return ESP_ERR_INVALID_STATE;
+    if (len == 0 || len > _write_partition->size) return ESP_ERR_INVALID_SIZE;
+
+    /* 256 B on the stack, mirroring IDF ota_calc_partition_bin_sha. */
+    uint8_t  buf[256];
+    uint32_t crc = 0;          /* seed 0 == standard zlib CRC-32 */
+    uint32_t off = 0;
+
+    while (off < len) {
+        uint32_t n = (len - off > sizeof(buf)) ? (uint32_t)sizeof(buf) : (len - off);
+        esp_err_t err = esp_partition_read(_write_partition, off, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "CRC read failed at %lu: %s",
+                     (unsigned long)off, esp_err_to_name(err));
+            return err;
+        }
+        crc = esp_crc32_le(crc, buf, n);
+        off += n;
+    }
+
+    if (crc != expected) {
+        ESP_LOGE(TAG, "CRC32 mismatch over %lu B: got %08lX, expected %08lX",
+                 (unsigned long)len, (unsigned long)crc, (unsigned long)expected);
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    ESP_LOGI(TAG, "CRC32 %08lX over %lu B - match",
+             (unsigned long)crc, (unsigned long)len);
+    return ESP_OK;
+}
 
 /* =============================================================================
  * ROLLBACK & VALIDATION

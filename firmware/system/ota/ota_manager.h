@@ -380,6 +380,37 @@ public:
     uint32_t bytesWritten() const;
     uint32_t expectedSize() const;
 
+    /**
+     * @brief Append to the open slot at an explicit offset.
+     *
+     * For transports where chunks arrive out of order (the ESP-NOW bulk
+     * plane). Backed by esp_ota_write_with_offset(), which is safe ONLY
+     * because beginWrite() passes a real size to esp_ota_begin() and the
+     * whole range is erased up front.
+     *
+     * Do NOT mix with writeChunk() in one session - the IDF advises
+     * against it and _write_mode enforces it.
+     *
+     * Duplicate offsets are the caller's problem: _bytes_written counts
+     * bytes accepted, so writing a chunk twice inflates it and breaks the
+     * completeness check in finishWrite(). Gate on a bitmap.
+     */
+    esp_err_t writeChunkAt(const void* data, size_t len, uint32_t offset);
+
+    /**
+     * @brief CRC32 the first len bytes of the open slot and compare.
+     *
+     * Call after the last chunk lands, before finishWrite(). Catches a
+     * chunk written at the wrong offset with valid-looking content -
+     * something esp_ota_end()'s image check cannot see.
+     *
+     * Standard zlib CRC-32: seed 0, chained, no final inversion. Matches
+     * Python zlib.crc32(). Sanity vector: CRC32("123456789") = 0xCBF43926.
+     *
+     * @return ESP_OK on match, ESP_ERR_INVALID_CRC on mismatch.
+     */
+    esp_err_t verifyCrc32(uint32_t expected, uint32_t len);
+
     /* ─── Rollback & Validation ────────────────────────────────────────── */
 
     /**
@@ -445,6 +476,11 @@ private:
     uint32_t                _bytes_written;
     uint32_t                _expected_size;
     bool                    _write_open;
+
+    /* Which write API this session committed to. Mixing sequential and
+     * offset writes corrupts the slot silently. */
+    enum class WriteMode : uint8_t { NONE, SEQUENTIAL, OFFSET };
+    WriteMode               _write_mode;
 
     OTAEventCb      _event_cb;
 };
