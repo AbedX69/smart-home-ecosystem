@@ -25,6 +25,8 @@
 #include "message_protocol.h"
 #include "auto_pair.h"
 #include "config_store.h"
+#include "ota_manager.h"
+#include "ota_bulk_rx.h"
 #include <esp_ota_ops.h>
 #include <esp_app_desc.h>
 
@@ -84,10 +86,25 @@ static void showPairLED(PairLED pattern) {
 static AckStatus onCommand(CmdId cmd, const uint8_t* payload, uint8_t len,
                            DeviceUid src_uid) {
 
+    /* A command that got this far came off the radio and passed house and
+     * room/node filtering - proof the receive path works end to end. That
+     * is the gate for validate(); booting alone is not. See "WHAT validate()
+     * SHOULD MEAN" in ota_manager.h. */
+    if (OTAManager::instance().isPendingValidation()) {
+        OTAManager::instance().validate();
+        ESP_LOGI(TAG, "Receive path proven - firmware validated, rollback cancelled");
+    }
+
     /* Pairing and commissioning traffic goes to AutoPair */
     if (AutoPair::handlesCmd(cmd)) {
         AutoPair::instance().processPairMessage(cmd, payload, len, src_uid);
         return AckStatus::OK;
+    }
+
+    /* OTA control plane. The ACK we return on OTA_OFFER is the accept
+     * or reject - there is no separate accept message. */
+    if (OtaBulkRx::handlesCmd(cmd)) {
+        return OtaBulkRx::instance().processControl(cmd, payload, len, src_uid);
     }
 
     switch (cmd) {
@@ -260,8 +277,26 @@ extern "C" void app_main(void) {
      * only MAC that crosses into the protocol layer, and it exists so
      * the address table can learn who is where.
      * ───────────────────────────────────────────────────────────────── */
+    /* OTA. begin() arms the rollback timer when this boot is unvalidated;
+     * without it a bad image never rolls back. Before the radio, so an
+     * offer arriving immediately has somewhere to land. */
+    OTAManager& ota = OTAManager::instance();
+    if (ota.begin(OTA_DEFAULT_TIMEOUT_S) != ESP_OK) {
+        ESP_LOGE(TAG, "OTAManager init failed");
+    }
+    if (OtaBulkRx::instance().begin(DeviceRole::LIGHT) != ESP_OK) {
+        ESP_LOGE(TAG, "OtaBulkRx init failed");
+    }
+    if (ota.isPendingValidation()) {
+        ESP_LOGW(TAG, "Unvalidated boot - rolls back in %us unless a command arrives",
+                 (unsigned)OTA_DEFAULT_TIMEOUT_S);
+    }
+
     EspNowManager& enm = EspNowManager::instance();
     enm.setReceiveCallback([](const uint8_t* sender, const uint8_t* data, int len) {
+        /* Bulk chunks are raw 248-byte frames, not 48-byte MessagePackets.
+         * Checked first so they never reach the packet parser. */
+        if (OtaBulkRx::instance().tryConsume(data, len)) return;
         MessageProtocol::instance().processMessage(data, (uint8_t)len, sender);
     });
     if (enm.begin() != ESP_OK) {              /* prints this device's MAC */
