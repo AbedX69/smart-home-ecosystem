@@ -237,6 +237,14 @@ extern "C" void app_main(void) {
     pair.setPeerAddCallback([](const uint8_t mac[6]) {
         EspNowManager::instance().addPeer(mac);
     });
+
+    /* How a channel change reaches the radio. auto_pair has no esp_now
+     * dependency, so it hands the channel out through this seam exactly
+     * as it does peer-adds. */
+    pair.setChannelSetCallback([](uint8_t ch) {
+        EspNowManager::instance().setChannel(ch);
+    });
+
     pair.setPairRequestCallback([](const PairRequestInfo* info) {
         ESP_LOGI(TAG, "PAIR REQUEST: \"%s\" uid %08X role=%s",
                  info->name, (unsigned)info->uid, deviceRoleName(info->role));
