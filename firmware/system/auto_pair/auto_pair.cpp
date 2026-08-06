@@ -65,6 +65,14 @@ AutoPair::AutoPair()
     , _request_cb(nullptr)
     , _result_cb(nullptr)
     , _led_cb(nullptr)
+    , _channel_cb(nullptr)
+    , _channel(0)
+    , _last_contact_us(0)
+    , _sweeping(false)
+    , _sweep_ch(AUTOPAIR_SWEEP_MIN_CH)
+    , _sweep_last_us(0)
+    , _pending_channel(0)
+    , _pending_apply_us(0)
     , _peer_add_cb(nullptr)
     , _peer_remove_cb(nullptr)
 {
@@ -89,7 +97,8 @@ bool AutoPair::handlesCmd(CmdId cmd) {
            cmd == CmdId::PAIR_ACCEPT  ||
            cmd == CmdId::PAIR_REJECT  ||
            cmd == CmdId::PAIR_UNPAIR  ||
-           cmd == CmdId::SET_LOCATION;
+           cmd == CmdId::SET_LOCATION ||
+           cmd == CmdId::SET_CHANNEL;
 }
 
 /* =============================================================================
@@ -142,9 +151,29 @@ void AutoPair::noteAddressLocked(DeviceUid uid, const uint8_t mac[6]) {
 }
 
 void AutoPair::noteAddress(DeviceUid uid, const uint8_t mac[6]) {
+    bool    found  = false;
+    uint8_t on_ch  = 0;
+
     lock();
     noteAddressLocked(uid, mac);
+
+    /* Any packet from our controller is proof of contact. This fires on
+     * every received message, so the sweep costs no extra traffic. */
+    if (!_is_controller && uid != UID_NONE && uid == _controller_uid) {
+        _last_contact_us = esp_timer_get_time();
+        if (_sweeping) {
+            _sweeping = false;
+            found     = true;
+            on_ch     = _channel;
+        }
+    }
     unlock();
+
+    if (found) {
+        ESP_LOGI(TAG, "Controller found on channel %u - persisting",
+                 (unsigned)on_ch);
+        ConfigStore::instance().setU8(ConfigKeys::WIFI_CHANNEL, on_ch);
+    }
 }
 
 bool AutoPair::resolveUid(DeviceUid uid, uint8_t out_mac[6]) const {
@@ -691,9 +720,142 @@ void AutoPair::update() {
             }
         }
     }
+    /* A SET_CHANNEL that asked us to wait. Applied here rather than in the
+     * handler so every node flips at the same moment instead of as their
+     * ACKs trickle back to the hub. */
+    uint8_t apply_now = 0;
+    if (_pending_channel && now >= _pending_apply_us) {
+        apply_now        = _pending_channel;
+        _pending_channel = 0;
+    }
     unlock();
 
+    if (apply_now) applyChannel(apply_now, true);
     if (do_request) sendPairRequest();
+
+    sweepTick(now);
+}
+
+
+/* =============================================================================
+ * CHANNEL
+ * ========================================================================== */
+
+void AutoPair::applyChannel(uint8_t channel, bool persist) {
+    if (channel < AUTOPAIR_SWEEP_MIN_CH || channel > AUTOPAIR_SWEEP_MAX_CH) {
+        ESP_LOGW(TAG, "Ignoring bad channel %u", (unsigned)channel);
+        return;
+    }
+
+    lock();
+    _channel = channel;
+    ChannelSetCb cb = _channel_cb;
+    unlock();
+
+    if (cb) cb(channel);        /* never call out under our own mutex */
+    if (persist) ConfigStore::instance().setU8(ConfigKeys::WIFI_CHANNEL, channel);
+    ESP_LOGI(TAG, "Channel %u applied%s", (unsigned)channel,
+             persist ? " and saved" : "");
+}
+
+void AutoPair::onSetChannel(const uint8_t* payload, uint8_t len,
+                            DeviceUid src_uid) {
+    if (_is_controller || !payload || len < 3) return;
+
+    /* Same authorisation rule as SET_LOCATION: only our own controller
+     * may move us. Otherwise anything in radio range can strand a node. */
+    lock();
+    bool ok = (_state == PairState::PAIRED && src_uid == _controller_uid);
+    unlock();
+    if (!ok) {
+        ESP_LOGW(TAG, "SET_CHANNEL from %08X ignored - not our controller",
+                 (unsigned)src_uid);
+        return;
+    }
+
+    uint8_t  ch    = payload[0];
+    uint16_t delay = (uint16_t)(payload[1] | (payload[2] << 8));
+
+    if (delay == 0) { applyChannel(ch, true); return; }
+
+    lock();
+    _pending_channel  = ch;
+    _pending_apply_us = esp_timer_get_time() + (int64_t)delay * 1000LL;
+    unlock();
+    ESP_LOGI(TAG, "Channel %u scheduled in %u ms",
+             (unsigned)ch, (unsigned)delay);
+}
+
+uint8_t AutoPair::announceChannel(uint8_t channel, uint16_t delay_ms) {
+    if (!_is_controller) return 0;
+    if (channel < AUTOPAIR_SWEEP_MIN_CH || channel > AUTOPAIR_SWEEP_MAX_CH) {
+        return 0;
+    }
+
+    uint8_t pl[3] = { channel,
+                      (uint8_t)(delay_ms & 0xFF),
+                      (uint8_t)(delay_ms >> 8) };
+
+    DeviceUid targets[AUTOPAIR_MAX_PAIRED];
+    uint8_t   n = 0;
+    lock();
+    for (uint8_t i = 0; i < _paired_count && n < AUTOPAIR_MAX_PAIRED; i++) {
+        targets[n++] = _paired[i].uid;
+    }
+    unlock();
+
+    for (uint8_t i = 0; i < n; i++) {
+        MessageProtocol::instance().sendCommandReliable(
+            targets[i], CmdId::SET_CHANNEL, pl, sizeof(pl), nullptr);
+    }
+    ESP_LOGI(TAG, "Announced channel %u (in %u ms) to %u device(s)",
+             (unsigned)channel, (unsigned)delay_ms, (unsigned)n);
+    return n;
+}
+
+void AutoPair::sweepTick(int64_t now) {
+    /* Runs with the lock NOT held: it invokes the channel callback and
+     * sends a probe, and AutoPair never calls out under its own mutex. */
+    uint8_t   probe_ch = 0;
+    DeviceUid ctrl     = UID_NONE;
+
+    lock();
+    do {
+        if (_is_controller || _state != PairState::PAIRED || !_channel_cb) break;
+
+        /* First tick after boot - start the clock, do not sweep. */
+        if (_last_contact_us == 0) { _last_contact_us = now; break; }
+
+        if (!_sweeping) {
+            if (now - _last_contact_us < AUTOPAIR_CONTACT_TIMEOUT_US) break;
+            _sweeping      = true;
+            _sweep_ch      = AUTOPAIR_SWEEP_MIN_CH;
+            _sweep_last_us = 0;
+            ESP_LOGW(TAG, "No controller contact in %d s - sweeping",
+                     (int)(AUTOPAIR_CONTACT_TIMEOUT_US / 1000000LL));
+        }
+
+        if (now - _sweep_last_us < AUTOPAIR_SWEEP_DWELL_US) break;
+        _sweep_last_us = now;
+
+        probe_ch  = _sweep_ch;
+        ctrl      = _controller_uid;
+        _channel  = probe_ch;
+
+        _sweep_ch = (_sweep_ch >= AUTOPAIR_SWEEP_MAX_CH)
+                    ? AUTOPAIR_SWEEP_MIN_CH : (uint8_t)(_sweep_ch + 1);
+    } while (0);
+    unlock();
+
+    if (probe_ch == 0) return;
+
+    if (_channel_cb) _channel_cb(probe_ch);
+
+    /* Fire-and-forget PING. If the controller is on this channel it ACKs,
+     * and that inbound packet stamps _last_contact_us via noteAddress(),
+     * which ends the sweep and saves the channel. The strip stays lit
+     * throughout - losing the hub should not turn the light off. */
+    MessageProtocol::instance().sendCommand(ctrl, CmdId::PING);
 }
 
 /* =============================================================================
@@ -715,6 +877,8 @@ void AutoPair::processPairMessage(CmdId cmd, const uint8_t* payload,
         onPairReject(src_uid);
     } else if (cmd == CmdId::SET_LOCATION) {
         onSetLocation(payload, len, src_uid);
+    } else if (cmd == CmdId::SET_CHANNEL) {
+        onSetChannel(payload, len, src_uid);
     }
     /* Anything else (e.g. a controller receiving an ACCEPT) is ignored. */
 }
@@ -1033,3 +1197,8 @@ void AutoPair::setPairResultCallback(PairResultCb cb)   { _result_cb  = cb; }
 void AutoPair::setLEDCallback(PairLEDCb cb)             { _led_cb     = cb; }
 void AutoPair::setPeerAddCallback(PeerAddCb cb)         { _peer_add_cb = cb; }
 void AutoPair::setPeerRemoveCallback(PeerRemoveCb cb)   { _peer_remove_cb = cb; }
+void AutoPair::setChannelSetCallback(ChannelSetCb cb)   { _channel_cb = cb; }
+
+bool AutoPair::isSweeping() const {
+    lock(); bool s = _sweeping; unlock(); return s;
+}

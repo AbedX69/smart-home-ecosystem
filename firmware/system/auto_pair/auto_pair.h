@@ -176,6 +176,20 @@
 #define AUTOPAIR_REJECT_COOLDOWN_US (10000000LL)    ///< Wait after rejection 10 s
 #define AUTOPAIR_PENDING_EXPIRY_US  (30000000LL)    ///< Drop stale requests 30 s
 
+/* ─── Channel recovery ────────────────────────────────────────────────────
+ * A paired node that stops hearing its controller has usually been left
+ * behind by a channel change - the hub joined WiFi and moved, or the router
+ * re-selected its channel. The node sweeps 1-13 looking for the hub and
+ * persists whichever channel answers.
+ *
+ * The strip stays LIT throughout. A light that goes dark because it lost
+ * its hub is a worse failure than one that quietly stops taking commands.
+ * ───────────────────────────────────────────────────────────────────────── */
+#define AUTOPAIR_CONTACT_TIMEOUT_US (600000000LL)   ///< 10 min before sweeping
+#define AUTOPAIR_SWEEP_DWELL_US     (300000LL)      ///< Listen 300 ms per channel
+#define AUTOPAIR_SWEEP_MIN_CH       1
+#define AUTOPAIR_SWEEP_MAX_CH       13              ///< 14 is Japan-only
+
 /* First node number handed out to a paired device. The controller itself
  * takes node 1, so children start at 2. */
 #define AUTOPAIR_FIRST_NODE         2
@@ -240,6 +254,10 @@ using PeerAddCb     = std::function<void(const uint8_t mac[6])>;
 
 /** Both sides: unregister `mac` (→ EspNowManager::removePeer). Optional. */
 using PeerRemoveCb  = std::function<void(const uint8_t mac[6])>;
+
+/** Apply a WiFi channel. auto_pair has no esp_now dependency by design,
+ *  so channel changes leave through this seam exactly as peer-adds do. */
+using ChannelSetCb  = std::function<void(uint8_t channel)>;
 
 /* ─── Main Class ──────────────────────────────────────────────────────────── */
 
@@ -311,6 +329,24 @@ public:
 
     void setPairResultCallback(PairResultCb cb);
     void setLEDCallback(PairLEDCb cb);
+
+    /** @brief How the node applies a channel. Set before begin(). */
+    void setChannelSetCallback(ChannelSetCb cb);
+
+    /** @brief Controller: tell every paired device to move channel.
+     *
+     *  Call BEFORE joining WiFi. Once the hub associates it has already
+     *  moved, and anything that missed the announcement is only reachable
+     *  by its own sweep.
+     *
+     *  @param channel    1-13
+     *  @param delay_ms   how long nodes wait before applying, so they
+     *                    switch together rather than as ACKs trickle in
+     *  @return number of devices the announcement was sent to */
+    uint8_t announceChannel(uint8_t channel, uint16_t delay_ms);
+
+    /** @brief True while hunting for a controller that moved. */
+    bool isSweeping() const;
 
     /* ─── Controller side ─────────────────────────────────────────────── */
 
@@ -409,6 +445,9 @@ private:
     void onPairAccept(const uint8_t* payload, uint8_t len, DeviceUid src_uid);
     void onPairReject(DeviceUid src_uid);
     void onSetLocation(const uint8_t* payload, uint8_t len, DeviceUid src_uid);
+    void onSetChannel(const uint8_t* payload, uint8_t len, DeviceUid src_uid);
+    void applyChannel(uint8_t channel, bool persist);
+    void sweepTick(int64_t now);
 
     /* Locked helpers — caller must hold _mutex */
     int    findPendingLocked(DeviceUid uid) const;
@@ -451,6 +490,17 @@ private:
     PairRequestCb   _request_cb;
     PairResultCb    _result_cb;
     PairLEDCb       _led_cb;
+    ChannelSetCb    _channel_cb;
+
+    /* Channel recovery. _last_contact_us is stamped by noteAddress() on any
+     * packet from the controller, so it costs nothing extra. */
+    uint8_t         _channel;           ///< 0 = never told
+    int64_t         _last_contact_us;
+    bool            _sweeping;
+    uint8_t         _sweep_ch;
+    int64_t         _sweep_last_us;
+    uint8_t         _pending_channel;   ///< 0 = none scheduled
+    int64_t         _pending_apply_us;
     PeerAddCb       _peer_add_cb;
     PeerRemoveCb    _peer_remove_cb;
 
