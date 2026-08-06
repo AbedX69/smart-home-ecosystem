@@ -967,6 +967,9 @@ void AutoPair::onPairAccept(const uint8_t* payload, uint8_t len,
     NodeId  n = NODE_UNASSIGNED;
     bool has_location = msgDecodeLocation(payload, len, h, r, n);
 
+    /* Optional 5th byte: the controllers channel. */
+    uint8_t accept_ch = (payload && len >= 5) ? payload[4] : 0;
+
     lock();
     if (_state == PairState::PAIRED) {
         bool same = (_controller_uid == src_uid);
@@ -1003,6 +1006,14 @@ void AutoPair::onPairAccept(const uint8_t* payload, uint8_t len,
     ESP_LOGI(TAG, "║  House 0x%04X  room %u  node %u",
              (unsigned)id.house(), (unsigned)id.room(), (unsigned)id.node());
     ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
+
+    /* Adopt the controllers channel before anything else talks to it.
+     * We are already receiving on it - this only makes it survive a
+     * reboot, so we do not have to rediscover it by sweeping. */
+    if (accept_ch >= AUTOPAIR_SWEEP_MIN_CH &&
+        accept_ch <= AUTOPAIR_SWEEP_MAX_CH) {
+        applyChannel(accept_ch, true);
+    }
 
     if (_peer_add_cb) _peer_add_cb(ctrl_mac);
     if (_led_cb)      _led_cb(PairLED::SOLID_ON);
@@ -1072,9 +1083,14 @@ void AutoPair::sendPairRequest() {
 }
 
 void AutoPair::sendPairAccept(DeviceUid uid, RoomId room, NodeId node) {
-    uint8_t p[4];
+    /* 5th byte is the channel we are on. A hub that has already followed
+     * the router would otherwise accept a fresh node and leave it deaf,
+     * waiting out the full sweep timeout for a problem we could have told
+     * it about here. Old nodes read the first four bytes and ignore this. */
+    uint8_t p[5];
     msgEncodeLocation(p, DeviceIdentity::instance().house(), room, node);
-    MessageProtocol::instance().sendCommand(uid, CmdId::PAIR_ACCEPT, p, 4);
+    p[4] = _channel;                /* 0 = hub was never told either */
+    MessageProtocol::instance().sendCommand(uid, CmdId::PAIR_ACCEPT, p, 5);
 }
 
 void AutoPair::sendPairReject(DeviceUid uid) {
