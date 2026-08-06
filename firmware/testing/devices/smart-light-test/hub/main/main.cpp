@@ -20,6 +20,7 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>
 #include <cstring>
+#include <cstdio>
 #include "gc9a01.h"
 #include "smart_light_remote.h"
 #include "esp_now_manager.h"
@@ -64,6 +65,9 @@ static const char* TAG = "hub";
 
 #define HEARTBEAT_US      30000000LL
 static int64_t s_last_tx_us[2] = {0, 0};
+
+/* Version poll fires once per boot. See the main loop for why. */
+static bool s_version_asked = false;
 
 
 
@@ -115,27 +119,97 @@ static void logFirmwareIdentity(void) {
  * pulling in bootloader_support. */
 #define APP_DESC_OFFSET  32
 
-static void logStagedImage(void) {
+/* Parse "M.m.p". False on anything else, and every caller treats that as
+ * "do not update" - an unreadable version fails closed, never open. */
+static bool parseVersion(const char* s, uint8_t& maj, uint8_t& mnr, uint8_t& pat) {
+    maj = 0; mnr = 0; pat = 0;
+    return sscanf(s, "%hhu.%hhu.%hhu", &maj, &mnr, &pat) == 3;
+}
+
+/* App descriptor of whatever image is staged in the storage partition.
+ * The single reader: logStagedImage() and the update decision share it. */
+static bool stagedImageDesc(esp_app_desc_t& out) {
     const esp_partition_t* store = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
     if (!store) {
-        ESP_LOGW(TAG, "Staged image: no storage partition found");
-        return;
+        ESP_LOGW(TAG, "No storage partition found");
+        return false;
     }
+    if (esp_partition_read(store, APP_DESC_OFFSET, &out, sizeof(out)) != ESP_OK) {
+        ESP_LOGW(TAG, "Storage partition read failed");
+        return false;
+    }
+    return out.magic_word == ESP_APP_DESC_MAGIC_WORD;
+}
 
+static void logStagedImage(void) {
     esp_app_desc_t d;
-    if (esp_partition_read(store, APP_DESC_OFFSET, &d, sizeof(d)) != ESP_OK) {
-        ESP_LOGW(TAG, "Staged image: read failed");
-        return;
-    }
-    if (d.magic_word != ESP_APP_DESC_MAGIC_WORD) {
-        ESP_LOGI(TAG, "Staged image: none (storage empty)");
+    if (!stagedImageDesc(d)) {
+        ESP_LOGI(TAG, "Staged image: none");
         return;
     }
     ESP_LOGI(TAG, "Staged image: \"%s\" v%s  sha %02x%02x%02x%02x",
              d.project_name, d.version,
              d.app_elf_sha256[0], d.app_elf_sha256[1],
              d.app_elf_sha256[2], d.app_elf_sha256[3]);
+}
+
+/* A node answered GET_VERSION. Decide whether it needs the staged image.
+ *
+ * The 4 sha bytes are NOT part of the decision - only the version triple
+ * is. They exist so "same version, different build" prints as its own line
+ * instead of looking identical to "already up to date". That is the exact
+ * confusion you hit the first time you forget to bump the version. */
+static void onNodeVersion(DeviceUid uid, const uint8_t* p, uint8_t len) {
+    if (len < 7) {
+        ESP_LOGW(TAG, "REPORT_VERSION from %08X: short payload (%u B)",
+                 (unsigned)uid, (unsigned)len);
+        return;
+    }
+
+    const unsigned nmaj = p[0], nmnr = p[1], npat = p[2];
+
+    esp_app_desc_t d;
+    if (!stagedImageDesc(d)) {
+        ESP_LOGI(TAG, "Node %08X runs v%u.%u.%u - nothing staged",
+                 (unsigned)uid, nmaj, nmnr, npat);
+        return;
+    }
+
+    uint8_t smaj, smnr, spat;
+    if (!parseVersion(d.version, smaj, smnr, spat)) {
+        ESP_LOGW(TAG, "Staged version is not M.m.p - refusing to update");
+        return;
+    }
+    if (nmaj == 0 && nmnr == 0 && npat == 0) {
+        ESP_LOGW(TAG, "Node %08X reported 0.0.0 - refusing to update",
+                 (unsigned)uid);
+        return;
+    }
+
+    const uint32_t node_v   = (nmaj << 16) | (nmnr << 8) | npat;
+    const uint32_t staged_v = ((uint32_t)smaj << 16) |
+                              ((uint32_t)smnr << 8)  | spat;
+
+    const bool sha_same = (p[3] == d.app_elf_sha256[0] &&
+                           p[4] == d.app_elf_sha256[1] &&
+                           p[5] == d.app_elf_sha256[2] &&
+                           p[6] == d.app_elf_sha256[3]);
+
+    ESP_LOGI(TAG, "Node %08X: v%u.%u.%u sha %02x%02x%02x%02x",
+             (unsigned)uid, nmaj, nmnr, npat, p[3], p[4], p[5], p[6]);
+    ESP_LOGI(TAG, "  Staged:   v%u.%u.%u sha %02x%02x%02x%02x",
+             (unsigned)smaj, (unsigned)smnr, (unsigned)spat,
+             d.app_elf_sha256[0], d.app_elf_sha256[1],
+             d.app_elf_sha256[2], d.app_elf_sha256[3]);
+
+    if (staged_v > node_v) {
+        ESP_LOGW(TAG, "  -> UPDATE NEEDED (ota_bulk_tx not built yet)");
+    } else if (staged_v == node_v && !sha_same) {
+        ESP_LOGW(TAG, "  -> same version, different image - bump the version");
+    } else {
+        ESP_LOGI(TAG, "  -> up to date");
+    }
 }
 
 static void logPairedDevices(void) {
@@ -219,6 +293,10 @@ extern "C" void app_main(void) {
             AutoPair::instance().processPairMessage(cmd, payload, len, src_uid);
             return AckStatus::OK;
         }
+        if (cmd == CmdId::REPORT_VERSION) {
+            onNodeVersion(src_uid, payload, len);
+            return AckStatus::OK;
+        }
         return AckStatus::UNKNOWN_CMD;
     });
     msg.setDeliveryCallback([](uint16_t seq, CmdId cmd, bool delivered,
@@ -264,8 +342,19 @@ extern "C" void app_main(void) {
      * WiFi and gets dragged somewhere else. */
     EspNowConfig enm_cfg;
     enm_cfg.channel = ConfigStore::instance().getU8(ConfigKeys::WIFI_CHANNEL, 0);
+
+    /* TEMP - BENCH ONLY - remove when REQ_CHANNEL lands.
+     * The strip NVS still holds channel 10 from the 06/08 sweep test. The
+     * hub has never stored a channel, so it boots on 1 and the two are deaf
+     * to each other. The recovery sweep that should fix this needs 10 min
+     * and picks the wrong channel anyway. Only applies when nothing is
+     * stored, so it stops mattering the moment the hub knows its own. */
     if (enm_cfg.channel) {
         ESP_LOGI(TAG, "Stored channel %u", (unsigned)enm_cfg.channel);
+    } else {
+        enm_cfg.channel = 10;
+        ESP_LOGW(TAG, "No stored channel - PINNED to %u for the bench",
+                 (unsigned)enm_cfg.channel);
     }
 
     if (enm.begin(enm_cfg) != ESP_OK) ESP_LOGE(TAG, "ESP-NOW init failed");
@@ -338,6 +427,23 @@ extern "C" void app_main(void) {
         if (++slow_tick >= 50) {
             slow_tick = 0;
             pair.update();
+
+            /* One-shot version poll ~5 s after boot: late enough that a node
+             * booting alongside us is listening, early enough to land in the
+             * boot log. Once per boot only - a failed transfer must not loop,
+             * and a node you USB-flash backwards mid-debug must not be
+             * silently overwritten by the hub. */
+            if (!s_version_asked && esp_timer_get_time() > 5000000LL) {
+                s_version_asked = true;
+                for (uint8_t vi = 0; vi < pair.getPairedCount(); vi++) {
+                    const PairedDevice* dv = pair.getPairedDevice(vi);
+                    if (!dv || dv->role != DeviceRole::LIGHT) continue;
+                    ESP_LOGI(TAG, "Asking %08X for its firmware version",
+                             (unsigned)dv->uid);
+                    MessageProtocol::instance().sendCommandReliable(
+                        dv->uid, CmdId::GET_VERSION);
+                }
+            }
 
             int64_t hb = esp_timer_get_time();
             if (hb - s_last_tx_us[0] > HEARTBEAT_US) sendPanelState(panel0, false);
