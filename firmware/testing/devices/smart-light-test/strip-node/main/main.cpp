@@ -299,7 +299,17 @@ extern "C" void app_main(void) {
         if (OtaBulkRx::instance().tryConsume(data, len)) return;
         MessageProtocol::instance().processMessage(data, (uint8_t)len, sender);
     });
-    if (enm.begin() != ESP_OK) {              /* prints this device's MAC */
+    /* Channel before the radio starts. ESP-NOW peers must share a channel,
+     * and the hub adopts the routers channel when it joins WiFi. A stored 0
+     * means we were never told - boot on the firmware default and let the
+     * recovery sweep go find the hub. */
+    EspNowConfig enm_cfg;
+    enm_cfg.channel = ConfigStore::instance().getU8(ConfigKeys::WIFI_CHANNEL, 0);
+    if (enm_cfg.channel) {
+        ESP_LOGI(TAG, "Stored channel %u", (unsigned)enm_cfg.channel);
+    }
+
+    if (enm.begin(enm_cfg) != ESP_OK) {       /* prints this device's MAC */
         ESP_LOGE(TAG, "ESP-NOW init failed");
         return;
     }

@@ -251,7 +251,16 @@ extern "C" void app_main(void) {
     enm.setReceiveCallback([](const uint8_t* sender, const uint8_t* data, int len) {
         MessageProtocol::instance().processMessage(data, (uint8_t)len, sender);
     });
-    if (enm.begin() != ESP_OK) ESP_LOGE(TAG, "ESP-NOW init failed");
+    /* Boot on the channel the nodes are on, not the routers. The hub has to
+     * be reachable long enough to announce a channel change BEFORE it joins
+     * WiFi and gets dragged somewhere else. */
+    EspNowConfig enm_cfg;
+    enm_cfg.channel = ConfigStore::instance().getU8(ConfigKeys::WIFI_CHANNEL, 0);
+    if (enm_cfg.channel) {
+        ESP_LOGI(TAG, "Stored channel %u", (unsigned)enm_cfg.channel);
+    }
+
+    if (enm.begin(enm_cfg) != ESP_OK) ESP_LOGE(TAG, "ESP-NOW init failed");
 
     /* Mints a house id if this hub has none, then loads the paired list. */
     pair.beginAsController();

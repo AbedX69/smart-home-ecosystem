@@ -102,6 +102,7 @@ namespace ConfigKeys {
     constexpr const char* PAIRED_MAC_2  = "pair_mac_2";     ///< blob (6 bytes)
     constexpr const char* PAIRED_MAC_3  = "pair_mac_3";     ///< blob (6 bytes)
     constexpr const char* CONFIGURED    = "configured";     ///< bool (first-run flag)
+    constexpr const char* WIFI_CHANNEL  = "wifi_chan";      ///< uint8_t (0 = default)
 }
 
 /* ─── Callback ───────────────────────────────────────────────────────────── */

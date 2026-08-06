@@ -466,6 +466,28 @@ esp_err_t EspNowManager::broadcast(const uint8_t* data, size_t len) {
  * UTILITIES
  * ========================================================================== */
 
+esp_err_t EspNowManager::setChannel(uint8_t channel) {
+    if (!_initialized)                 return ESP_ERR_INVALID_STATE;
+    if (channel < 1 || channel > 13)   return ESP_ERR_INVALID_ARG;
+
+    esp_err_t ret = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Set channel %u failed: %s",
+                 (unsigned)channel, esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Channel -> %u", (unsigned)channel);
+    return ESP_OK;
+}
+
+uint8_t EspNowManager::getChannel() const {
+    if (!_initialized) return 0;
+    uint8_t prim = 0;
+    wifi_second_chan_t sec;
+    if (esp_wifi_get_channel(&prim, &sec) != ESP_OK) return 0;
+    return prim;
+}
+
 esp_err_t EspNowManager::getOwnMac(uint8_t* mac) const {
     if (mac == nullptr) return ESP_ERR_INVALID_ARG;
     return esp_read_mac(mac, ESP_MAC_WIFI_STA);

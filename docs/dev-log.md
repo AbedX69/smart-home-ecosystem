@@ -4030,6 +4030,274 @@ Commits: `0f59be9`, `cac00eb`, `0065db3`, `85331b6`, `8b451de`.
 
 
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+
+
+
+
+
+
+# Dev Log — 06/08/2026 (Thu)
+
+**Project:** Smart Home Ecosystem — firmware repository
+**Scope:** Phase 2 — ESP-NOW bulk plane: freeze the wire format, extend the OTA sink, build the receiver
+**Outcome:** Receiver compiles, links, and boots on hardware. Sender does not exist yet, so zero transfer testing. Both boards finally off `ota-test` firmware.
+
+---
+
+## Commits
+
+| Hash | Subject |
+|------|---------|
+| `1724d57` | freeze ESP-NOW bulk plane wire format |
+| *(fill)* | add offset-write and CRC32 verify to OTAManager sink |
+| *(fill)* | correct s3_wroom flash size to 16MB |
+| `a067083` | add ESP-NOW bulk plane receiver |
+| `40f110b` | wire OTA rollback and bulk receiver into strip-node |
+
+---
+
+## The correction that reshaped the design
+
+Last session's design put an **in-order write constraint** at the centre: `esp_ota_write` is
+sequential, the C6 can't buffer a 923 KB image in 354 KB of heap, therefore chunks must be
+written in arrival order, therefore a windowed transfer with a per-window gap bitmap.
+
+That was wrong. **`esp_ota_write_with_offset()` exists** and writes non-contiguously. It is
+documented for exactly this case — OTA packets arriving out of order.
+
+It works only because `esp_ota_begin()` is given a real image size, which erases the whole
+needed range up front. Reading the IDF source (`components/app_update/esp_ota_ops.c`)
+confirmed the enforcement: `esp_ota_write_with_offset` opens with
+`assert(it->need_erase == 0)`. `need_erase` is set by `(image_size == OTA_WITH_SEQUENTIAL_WRITES)`,
+i.e. `0xfffffffe`. `beginWrite()` never passes that, so we are safe — and if anyone ever
+changes it, the failure is a loud panic, not silent corruption.
+
+**Everything downstream collapsed:**
+
+| Was | Now |
+|-----|-----|
+| Windowed transfer, 64 chunks | No window at all |
+| Per-window bitmap | Whole-image bitmap, 481 B for a real image |
+| 15 KB RAM buffer option | Zero buffering — chunk *k* writes to offset *k × 240* |
+| 230-byte chunks | 240-byte chunks (16-aligned for future flash encryption) |
+
+Also checked and cleared: `esp_ota_write_with_offset` is a bare `esp_partition_write`, nothing
+buffered or held back, so reading the slot back **before** `esp_ota_end()` returns exactly what
+was written. IDF's own `ota_calc_partition_bin_sha()` does the same thing on an open handle.
+The CRC-before-finish plan is sound.
+
+---
+
+## Wire format (frozen — `system/ota_bulk/ota_bulk.h`, 235 lines, no implementation)
+
+**Chunk frame** — raw `esp_now_send`, 8 + 240 = 248 B (limit 250):
+
+```
+off  size  field
+  0     2  magic         0x4F54, the demux tag
+  2     2  chunk_index   flash offset is index * chunk_size
+  4     4  session_id    esp_random() per transfer
+  8   240  payload
+```
+
+Header is 8 bytes rather than 6 so the payload pointer stays 8-byte aligned in the RX buffer.
+No `payload_len` field — derivable from index and image size, and ESP-NOW hands you the frame
+length anyway.
+
+**Control plane** — CmdId `0x80`–`0x84` on the ordinary 48-byte reliable path, inheriting
+retry/backoff, dedup and ACK for free. Six messages per transfer, not four thousand.
+
+- `0x80 OTA_OFFER` — 18/24 B. **The ACK is the accept/reject**; there is no separate accept
+  message. `NOT_SUPPORTED` / `BUSY` / `FAIL` / `OK`.
+- `0x81 OTA_PASS_END` — "that's everything this pass"
+- `0x82 OTA_GAP_REPORT` — 23/24 B, up to 4 runs of `(start, count)`
+- `0x83 OTA_COMPLETE`
+- `0x84 OTA_ABORT`
+
+`0x85`–`0x8F` remain free.
+
+**Gap runs, not a paginated bitmap:** a 923 KB image is 3,845 chunks — a 481-byte bitmap needs
+21 packets to ship back. The common case is three missing chunks, which runs describe in one.
+
+Six `static_assert`s hold every payload under the 24-byte `MessagePacket` limit, so a future
+field that overflows is a build error rather than silent truncation on the wire.
+
+---
+
+## OTAManager sink extension
+
+- **`writeChunkAt(data, len, offset)`** — wraps `esp_ota_write_with_offset`. Duplicate offsets
+  are the caller's problem: `_bytes_written` counts bytes accepted, so writing a chunk twice
+  inflates it and breaks the completeness check in `finishWrite()`. Gate on a bitmap.
+- **`verifyCrc32(expected, len)`** — reads the slot back in 256 B blocks (mirroring IDF's own
+  loop) and compares. Catches a chunk written at the wrong offset with structurally valid
+  content, which `esp_ota_end()`'s image check cannot see.
+- **`WriteMode` guard** — `NONE`/`SEQUENTIAL`/`OFFSET`, set on first write, rejects mixing.
+  Offset writes bump `wrote_size`, so a later `writeChunk()` would land at a wrong offset. That
+  direction *is* silent corruption; the other direction panics on the assert.
+
+No `PROGRESS` event from `writeChunkAt` — out-of-order arrival makes `_bytes_written` a count
+rather than a position, and the bulk plane reports progress from its own bitmap.
+
+---
+
+## Receiver — `system/ota_bulk/ota_bulk_rx.{h,cpp}`
+
+**Chunks go through a queue and a dedicated task, not straight to flash from the RX callback.**
+A flash program op disables the cache, which stalls anything executing from flash including the
+WiFi task itself. On a single-core C6 that means dropping the very chunks you're about to ask
+for again — an intermittent failure that would look like an RF problem. Queue is 16 × 244 B
+≈ 3.9 KB, allocated from heap at runtime.
+
+**The bitmap is owned by the task.** `tryConsume()` deliberately does *not* check it for
+duplicates — that would mean reading it from a second context for what is only an optimisation.
+The task re-checks before every write, so a duplicate costs one queue slot and nothing else.
+
+**Gap reports are emitted by the task after the queue drains,** not synchronously in the
+`PASS_END` handler. Reporting from the handler would list chunks sitting in the queue unwritten,
+and the hub would resend them pointlessly.
+
+**`_session` is written last on start and first on stop,** so the RX callback never sees a
+half-built session.
+
+**Authorisation happens before any bytes move:** `src_uid == AutoPair::getControllerUid()` and
+`target_role == self_role`, both on the `OTA_OFFER` ACK path.
+
+**Gap-run walker fuzz-tested on the host** — 3,000 random bitmaps against a brute-force
+reference, zero mismatches. Realistic case (3 holes in 3,845 chunks) produces 3 runs in a single
+packet.
+
+**Known cost:** `processControl` runs in the RX callback and takes `_mtx`, which the writer task
+holds across a flash write. A control packet arriving mid-write blocks the ESP-NOW RX task for
+up to ~1 ms. Bounded and acceptable, but it's the first thing to look at if pairing traffic gets
+flaky during a transfer.
+
+---
+
+## strip-node wiring
+
+- `OTAManager::begin(OTA_DEFAULT_TIMEOUT_S)` — **this is what arms the rollback timer.** The
+  strip wasn't calling it. Without it a bad image never rolls back and the strip bricks, which
+  is the entire point of Phase 2.
+- `validate()` gated on **the first command reaching `onCommand()`**. That packet came off the
+  radio and passed house + room/node filtering, so the receive path is proven end to end.
+  Booting alone is not proof — per "WHAT validate() SHOULD MEAN" in `ota_manager.h`, perfect
+  LEDs and a broken receive path is a ladder.
+- `tryConsume()` first in the receive callback, so raw 248-byte frames never reach the 48-byte
+  parser.
+
+---
+
+## Hardware verification
+
+Both boards reflashed off `ota-test` firmware — an item that had been carried for three sessions.
+
+**Strip (COM7, XIAO C6):**
+```
+smart_light_strip v0.1.0 sha cb16dba2
+Running: app0 @ 0x00010000 (1856KB)   Next slot: app1 @ 0x001E0000
+Pending: no    Rollback: available
+OtaBulkRx: Bulk RX ready (role=Light, queue=16 x 244 B, chunk=240 B)
+AutoPair: Already paired to controller FEBDCDC3 (house 0x6F19 room 2 node 2)
+```
+
+**Hub (COM4, S3 WROOM):**
+```
+smart_light_hub v0.1.0 sha 15273af8
+Slot: app0 @ 0x010000 (4096 KB)
+[0] EE907A91  Light  r2/n2  "Strip 1"
+Staged image: none (storage empty)
+```
+
+**Both NVS sides survived a full app-partition rewrite.** This closes the Phase 1 item recorded
+as "strip NVS after true power-cycle unverified" — and it's a stronger test than the original,
+since the app partition was completely overwritten underneath it.
+
+Live traffic confirms `onCommand()` runs in normal operation (hub keepalive every 30.5 s,
+strip ACKs each one), so the `validate()` gate has a real trigger path rather than a
+theoretical one.
+
+Build matrix: `esp32d`, `s3_seeed`, `c6_seeed`, `s3_wroom` all green.
+
+---
+
+## Pre-existing defects found (none related to OTA)
+
+1. **`ota-test` `s3_wroom` had never built.** Pointed at `partitions_16mb.csv` while the board
+   default configured 8 MB, so it died at partition generation before compiling a single
+   source. **Fixed** — added `board_upload.flash_size` / `maximum_size`. Note this means the S3
+   rollback verification from last session came from somewhere other than this env.
+2. **`strip-node` `s3_wroom` has the identical bug.** Not fixed.
+3. **`esp_now` path mismatch in strip-node** — `EXTRA_COMPONENT_DIRS` says `wireless/esp_now`,
+   `build_flags` says `wireless/communication/esp_now`. One is wrong; since it builds, the `-I`
+   flags are apparently not load-bearing. Not fixed.
+4. **GCC ICE** (`internal compiler error: Segmentation fault`) in `esp_lcd_panel_rgb.c` on
+   `s3_seeed` — stale build dir, cleared by `pio run -t clean`.
+
+---
+
+## Learnings
+
+1. **`esp_ota_write_with_offset()` removes the in-order constraint entirely.** Verified from IDF
+   source, not just docs — the `assert(need_erase == 0)` is the thing that makes it safe.
+2. **`esp_rom_crc32_le` applies `~` at both ends.** Seed **0** gives standard zlib CRC-32
+   (matches Python `zlib.crc32()`). Seeding `0xFFFFFFFF` gives a value that matches nothing —
+   and the failure would appear only at the last step of every transfer.
+3. **PS 5.1 `Get-Content -Raw` reads as ANSI, not UTF-8.** On files full of `─` and `═` that
+   silently mangles every box character on read *and* on write-back. `-Encoding UTF8` on both
+   ends; `[System.IO.File]::WriteAllText` with `UTF8Encoding($false)` to avoid adding a BOM.
+4. **`\"` is a C escape, not a PowerShell one.** Any line containing a C string literal goes in
+   a single-quoted PS string.
+5. **Anchor `.Replace()` on pure-ASCII substrings.** The comment line contained an en-dash
+   (`0x80–0x8F`); matching non-ASCII through the console is how you get a silent no-op.
+6. **Verify with `git diff`, not a proxy metric.** A U+2500 character count was used as a
+   corruption canary and produced a false alarm, because the canary was a guess about house
+   style rather than a fact. Predicted counts were wrong three times this session; `git diff`
+   was right every time.
+7. **`pio run` with no `-e` builds `default_envs` only**, not every env. A "successful build"
+   can mean neither real target was compiled.
+8. **Flash-size delta proves the linker included new code.** After adding the component but
+   before wiring it, the image was 902,381 B — `--gc-sections` had stripped `OtaBulkRx` because
+   nothing referenced it. After wiring: 926,781 B. Compiling and linking are different claims.
+9. **A serial reflash of the app partition doesn't touch NVS.** Both devices came back knowing
+   each other.
+
+---
+
+## Next Steps
+
+- [ ] **Design the hub's image source** — nothing puts a `.bin` into the hub's `storage`
+      partition yet (`Staged image: none`). `logStagedImage()` already reads from there, so
+      there's existing intent — read `system/ota_http` before designing. **This blocks the
+      sender, which blocks all receiver testing.**
+- [ ] `ota_bulk_tx` — hub-side sender: pacing on the ESP-NOW send callback, pass/gap loop
+- [ ] End-to-end transfer test on hardware, including a deliberately corrupted image
+- [ ] NVS state persistence (`last_state` + `power_on_behavior`, ~10 s debounce)
+- [ ] Pairing recovery (strip re-opens for pairing after ~10 min with no hub contact, stays lit)
+- [ ] `strip-node` `s3_wroom` flash-size fix (same as the `ota-test` one)
+- [ ] `esp_now` path mismatch in `strip-node`
+- [ ] `.gitattributes` for the CRLF warnings (still skipped, still harmless)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################
 ##############################################################################################################################################################################################################################################################################################################################################################################################################################

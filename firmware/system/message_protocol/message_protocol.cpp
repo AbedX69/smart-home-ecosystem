@@ -767,6 +767,7 @@ const char* MessageProtocol::cmdName(CmdId cmd) {
         case CmdId::PAIR_REJECT:     return "PAIR_REJECT";
         case CmdId::PAIR_UNPAIR:     return "PAIR_UNPAIR";
         case CmdId::SET_LOCATION:    return "SET_LOCATION";
+        case CmdId::SET_CHANNEL:     return "SET_CHANNEL";
         case CmdId::OTA_OFFER:       return "OTA_OFFER";
         case CmdId::OTA_PASS_END:    return "OTA_PASS_END";
         case CmdId::OTA_GAP_REPORT:  return "OTA_GAPS";

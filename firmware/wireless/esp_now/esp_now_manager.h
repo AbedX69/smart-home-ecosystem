@@ -529,6 +529,23 @@ public:
     esp_err_t getOwnMac(uint8_t* mac) const;
 
     /**
+     * @brief Change the WiFi channel while ESP-NOW is running.
+     *
+     * ESP-NOW peers must share a channel. The hub adopts the routers
+     * channel when it joins WiFi, so nodes have to follow. This is also
+     * what the recovery sweep uses to hunt for a hub that moved.
+     *
+     * Peers are unaffected - peer entries store channel 0, meaning
+     * "whatever the interface is on".
+     *
+     * @param channel  1-13 (14 is Japan-only and not used here)
+     */
+    esp_err_t setChannel(uint8_t channel);
+
+    /** @brief Current primary channel, or 0 if not started. */
+    uint8_t getChannel() const;
+
+    /**
      * @brief Format a MAC address as a string "AA:BB:CC:DD:EE:FF".
      * 
      * @param mac  6-byte MAC address

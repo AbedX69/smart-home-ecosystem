@@ -209,6 +209,12 @@ enum class CmdId : uint8_t {
     /* ── Commissioning ──── */
     SET_LOCATION    = 0x74,     ///< Re-address a device over the air.
                                 ///< Payload: [house_lo, house_hi, room, node]
+    SET_CHANNEL     = 0x75,     ///< Move a node to a new WiFi channel.
+                                ///< Payload: [channel, delay_lo, delay_hi]
+                                ///< The hub adopts the routers channel when
+                                ///< it joins WiFi; nodes must follow or go
+                                ///< deaf. delay_ms lets every node switch at
+                                ///< the same moment rather than as ACKs land.
 
     /* 0x80–0x8F assigned below; 0x85-0x8F still free */
 
