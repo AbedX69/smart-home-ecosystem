@@ -72,7 +72,9 @@
  *
  *     if (stg.hasImage()) {
  *         const StagedImageInfo& i = stg.info();
- *         stg.readAt(chunk_index * 240, buf, 240);
+ *         uint32_t off = chunk_index * 240;
+ *         uint32_t n   = (i.size - off > 240) ? 240 : (i.size - off);
+ *         stg.readAt(off, buf, n);        // MUST clamp - see readAt()
  *     }
  *
  * =============================================================================
@@ -162,6 +164,29 @@ public:
 
     /** @brief Discard a partial stage. The old image stays invalid. */
     void stageAbort();
+
+    /**
+     * @brief Adopt an image already sitting in `storage`, written by
+     *        something other than stageBegin/Write/Finish.
+     *
+     * esptool can write the partition but cannot write NVS, so after a raw
+     * flash the bytes are there and hasImage() is still false. This walks
+     * the image to recover the one fact only the uploader knew - its exact
+     * length - then reuses the normal descriptor + CRC + commit path.
+     *
+     * Length comes from esp_image_get_metadata(), which passes do_verify =
+     * false internally and therefore SKIPS the chip-ID check. That matters:
+     * the staged image is for a C6 while the hub is an S3, and
+     * esp_image_verify() would reject it on chip ID alone.
+     *
+     * Also a genuine recovery path, not only bench scaffolding: NVS erased
+     * with the flashed image intact is exactly this situation.
+     *
+     * @param target_role  the role this image is FOR. Still supplied, never
+     *                     inferred from project_name - see above.
+     * @return ESP_ERR_NOT_FOUND if the bytes are not a parseable image.
+     */
+    esp_err_t adoptRawImage(DeviceRole target_role);
 
     bool     isStaging()   const { return _staging; }
     uint32_t bytesStaged() const { return _written; }

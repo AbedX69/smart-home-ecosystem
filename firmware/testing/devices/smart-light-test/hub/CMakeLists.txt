@@ -12,6 +12,8 @@ set(EXTRA_COMPONENT_DIRS
     "../../../../system/config_store"
     "../../../../system/core_types"
     "../../../../system/device_identity"
+    "../../../../system/ota"
+    "../../../../system/ota_stage"
 
 )
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

@@ -18,7 +18,8 @@
 #include <cstdio>
 #include <esp_log.h>
 #include <esp_crc.h>
-#include <esp_app_format.h>
+#include <esp_app_desc.h>
+#include <esp_image_format.h>
 
 #include "config_store.h"
 
@@ -214,6 +215,75 @@ void OtaStage::stageAbort() {
     _written  = 0;
     _info.valid = false;
     ConfigStore::instance().setU8(OTA_STAGE_KEY_VALID, 0);
+}
+
+
+/* =============================================================================
+ * ADOPT A RAW-FLASHED IMAGE
+ * =============================================================================
+ *
+ * Everything stageFinish() does except the length, which it gets from the
+ * caller. Here the length has to be recovered from the bytes themselves.
+ * ========================================================================== */
+
+esp_err_t OtaStage::adoptRawImage(DeviceRole target_role) {
+    if (!_initialized) return ESP_ERR_INVALID_STATE;
+    if (_staging)      return ESP_ERR_INVALID_STATE;
+
+    /* Invalidate first, exactly as stageBegin() does: if anything below
+     * fails we must not leave the old metadata pointing at new bytes. */
+    _info.valid = false;
+    ConfigStore::instance().setU8(OTA_STAGE_KEY_VALID, 0);
+
+    /* esp_image_get_metadata() passes do_verify = false internally, so
+     * verify_image_header() - and with it the chip-ID check - never runs.
+     * That is load-bearing here: this is a C6 image in an S3 hub, and
+     * esp_image_verify() would reject it on chip ID before reading a byte.
+     * image_len ends up as 24 B header + segments + checksum pad to 16 +
+     * 32 B appended hash, i.e. the true on-flash length. */
+    esp_partition_pos_t pos = {};
+    pos.offset = _part->address;
+    pos.size   = _part->size;
+
+    esp_image_metadata_t meta = {};
+    esp_err_t err = esp_image_get_metadata(&pos, &meta);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No parseable image in \"%s\": %s",
+                 OTA_STAGE_PARTITION_LABEL, esp_err_to_name(err));
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (meta.image_len == 0 || meta.image_len > _part->size) {
+        ESP_LOGE(TAG, "Implausible image length %lu",
+                 (unsigned long)meta.image_len);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    err = readAppDesc();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Image has no app descriptor");
+        return err;
+    }
+
+    uint32_t crc = 0;
+    err = computeCrc(meta.image_len, &crc);
+    if (err != ESP_OK) return err;
+
+    _info.valid = true;
+    _info.size  = meta.image_len;
+    _info.crc32 = crc;
+    _info.role  = target_role;
+
+    err = saveMeta();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Metadata commit failed: %s", esp_err_to_name(err));
+        _info.valid = false;
+        return err;
+    }
+
+    ESP_LOGW(TAG, "Adopted raw image \"%s\" v%s for %s - %lu B, crc %08lX",
+             _info.name, _info.version, deviceRoleName(_info.role),
+             (unsigned long)_info.size, (unsigned long)_info.crc32);
+    return ESP_OK;
 }
 
 

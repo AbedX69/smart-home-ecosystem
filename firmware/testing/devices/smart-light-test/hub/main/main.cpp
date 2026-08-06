@@ -28,6 +28,7 @@
 #include "auto_pair.h"
 #include "config_store.h"
 #include "device_identity.h"
+#include "ota_stage.h"
 #include <esp_ota_ops.h>
 #include <esp_app_desc.h>
 #include <esp_partition.h>
@@ -372,6 +373,17 @@ extern "C" void app_main(void) {
     logPairedDevices();
     ESP_LOGI(TAG, "══════════════════════════════════════════");
     logFirmwareIdentity();
+
+    /* Stage area. begin() only reads NVS metadata; the bytes themselves are
+     * whatever esptool or an uploader last left in the storage partition. */
+    OtaStage& stage = OtaStage::instance();
+    stage.begin();
+    /* Unconditional, not just when hasImage() is false. esptool can replace
+     * the bytes without touching NVS, so stale metadata would otherwise be
+     * served against a new image - a CRC failure at the last step of every
+     * transfer, looking exactly like a transport bug. Costs one CRC pass
+     * over ~900 KB at boot. Revisit when ota_stage_http is the only writer. */
+    stage.adoptRawImage(DeviceRole::LIGHT);
     logStagedImage();
     ESP_LOGI(TAG, "Entering main loop...");
 
