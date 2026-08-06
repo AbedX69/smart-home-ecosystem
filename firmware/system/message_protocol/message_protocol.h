@@ -185,6 +185,10 @@ enum class CmdId : uint8_t {
     GET_HUMIDITY    = 0x41,
     GET_STATE       = 0x42,     ///< Generic "what's your state?"
     GET_BATTERY     = 0x43,
+    GET_VERSION     = 0x44,     ///< "what firmware are you running?"
+                                ///< No payload. Answered by REPORT_VERSION.
+                                ///< Asked, never cached: a stored version is
+                                ///< stale the moment a node is reflashed.
 
     /* ── State Reports ──── */
     REPORT_TEMP     = 0x50,     ///< Payload: [int16_t temp_x100]
@@ -192,7 +196,13 @@ enum class CmdId : uint8_t {
     REPORT_ON_OFF   = 0x52,     ///< Payload: [uint8_t 0=off 1=on]
     REPORT_LEVEL    = 0x53,     ///< Payload: [uint8_t level]
     REPORT_BATTERY  = 0x54,     ///< Payload: [uint8_t percent]
-    REPORT_LIGHT_STATE = 0x55,  ///< Payload: [on, brightness, hue_hi, hue_lo, white]
+    REPORT_LIGHT_STATE = 0x55,
+    REPORT_VERSION  = 0x56,     ///< Payload: [major, minor, patch, sha0..sha3]
+                                ///< The 4 sha bytes are app_elf_sha256[0..3].
+                                ///< LOGGING ONLY - never part of an update
+                                ///< decision. They exist so "same version,
+                                ///< different image" is visible instead of
+                                ///< silent (i.e. you forgot to bump).  ///< Payload: [on, brightness, hue_hi, hue_lo, white]
 
     /* ── Garage ─────────── */
     GARAGE_OPEN     = 0x60,

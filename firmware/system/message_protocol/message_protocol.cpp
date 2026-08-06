@@ -753,12 +753,14 @@ const char* MessageProtocol::cmdName(CmdId cmd) {
         case CmdId::GET_HUMIDITY:    return "GET_HUM";
         case CmdId::GET_STATE:       return "GET_STATE";
         case CmdId::GET_BATTERY:     return "GET_BAT";
+        case CmdId::GET_VERSION:     return "GET_VER";
         case CmdId::REPORT_TEMP:     return "RPT_TEMP";
         case CmdId::REPORT_HUMIDITY: return "RPT_HUM";
         case CmdId::REPORT_ON_OFF:   return "RPT_ONOFF";
         case CmdId::REPORT_LEVEL:    return "RPT_LEVEL";
         case CmdId::REPORT_BATTERY:  return "RPT_BAT";
         case CmdId::REPORT_LIGHT_STATE: return "RPT_LIGHT";
+        case CmdId::REPORT_VERSION:  return "RPT_VER";
         case CmdId::GARAGE_OPEN:     return "GARAGE_OPEN";
         case CmdId::GARAGE_CLOSE:    return "GARAGE_CLOSE";
         case CmdId::GARAGE_STOP:     return "GARAGE_STOP";
