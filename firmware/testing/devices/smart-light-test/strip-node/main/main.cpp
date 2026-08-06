@@ -19,6 +19,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <cstdio>
 #include "device_identity.h"
 #include "smart_light_device.h"
 #include "esp_now_manager.h"
@@ -36,6 +38,9 @@ static const char* TAG = "strip_node";
 #define NUM_LEDS    10              /* POC — full strip is 144 */
 
 static SmartLightDevice s_strip(STRIP_PIN, NUM_LEDS);
+
+/* Set by CmdId::REBOOT, actioned in the main loop. See the handler. */
+static volatile bool s_reboot_pending = false;
 
 
 /* ─── Pairing feedback rendered on the strip ──────────────────────────────── */
@@ -156,6 +161,39 @@ static AckStatus onCommand(CmdId cmd, const uint8_t* payload, uint8_t len,
             s_strip.setHue(hue);
             s_strip.setWhite(w);
             s_strip.update();
+            return AckStatus::OK;
+        }
+
+        case CmdId::REBOOT:
+            /* Cannot restart here. MessageProtocol runs this handler and
+             * sends the ACK only after it returns, so restarting inside it
+             * means the hub never hears OK and burns all 5 retries on a
+             * device that is already gone. Defer to the main loop. */
+            ESP_LOGW(TAG, "REBOOT commanded - restarting shortly");
+            s_reboot_pending = true;
+            return AckStatus::OK;
+
+        case CmdId::GET_VERSION: {
+            /* Answered live, never cached on the hub - a stored version is
+             * stale the moment this node is reflashed over USB. */
+            const esp_app_desc_t* d = esp_app_get_description();
+            uint8_t maj = 0, min = 0, pat = 0;
+
+            /* CONFIG_APP_PROJECT_VER is a free-form string. Anything that
+             * is not major.minor.patch reports 0.0.0, and the hub treats
+             * 0.0.0 as "do not update" - failing closed, not open. */
+            if (sscanf(d->version, "%hhu.%hhu.%hhu", &maj, &min, &pat) != 3) {
+                maj = 0; min = 0; pat = 0;
+                ESP_LOGW(TAG, "Version \"%s\" is not M.m.p - reporting 0.0.0",
+                         d->version);
+            }
+
+            const uint8_t v[7] = { maj, min, pat,
+                                   d->app_elf_sha256[0], d->app_elf_sha256[1],
+                                   d->app_elf_sha256[2], d->app_elf_sha256[3] };
+
+            MessageProtocol::instance().sendCommandReliable(
+                src_uid, CmdId::REPORT_VERSION, v, sizeof(v));
             return AckStatus::OK;
         }
 
@@ -328,6 +366,10 @@ extern "C" void app_main(void) {
     logFirmwareIdentity();
 
     while (true) {
+        if (s_reboot_pending) {
+            vTaskDelay(pdMS_TO_TICKS(200));   /* let the ACK reach the radio */
+            esp_restart();
+        }
         pair.update();
         vTaskDelay(pdMS_TO_TICKS(500));
     }
